@@ -1,0 +1,12 @@
+{
+  "human_minutes_per_ai_hour": 20,
+  "idle_gap_minutes": 15,
+  "rounding_step_hours": 0.25,
+  "timezone": null,
+  "authors": [
+    "mikebronner",
+    "dr-john-h-watson[bot]",
+    "mr-sherlock-holmes[bot]",
+    "inspector-g-lestrade[bot]"
+  ]
+}
