@@ -1,13 +1,14 @@
 # workbench-freshbooks-timetracking
 
 A Claude Code plugin that turns AI development work in GitHub repos into
-reproducible time lines for FreshBooks. Phase 1 works offline: it reads
-Claude Code transcripts and GitHub, and prints line items for review.
-Nothing reaches FreshBooks yet.
+reproducible time lines for FreshBooks. It reads Claude Code transcripts and
+GitHub, prints line items for review, and creates FreshBooks time entries only
+for a set of lines that was approved.
 
 ## Requirements
 
 - `node` 20 or later, `git`, and `gh` signed in to GitHub
+- macOS, for the keychain, and `openssl` for the login listener
 - `shellcheck` and `jq` for `scripts/lint.sh`
 
 ## Configuration
@@ -23,6 +24,14 @@ to another path. The file holds no secrets.
 | `rounding_step_hours` | 0.25 | Each line rounds up to a multiple of this |
 | `timezone` | system zone | IANA zone that decides the work day |
 | `authors` | required | GitHub logins whose PRs are billable; Apps as `slug[bot]` |
+| `freshbooks.client_id` | none | Client id of the FreshBooks app |
+| `freshbooks.redirect_uri` | `https://localhost:8080/callback` | Redirect URI registered on the app; HTTPS, no query string |
+| `freshbooks.business_id`, `freshbooks.account_id` | set by login | Business the entries go to; set `business_id` first if the login has several |
+| `freshbooks.repos` | `{}` | Lower-case `owner/name` to `{client_id, project_id, service_id}`, saved by `map.sh` |
+
+The client secret and the tokens live only in the macOS keychain, under the
+service `workbench-freshbooks-timetracking`. No script prints them, and none
+passes them as a command argument.
 
 ## Commands
 
@@ -35,6 +44,44 @@ bin/estimate.sh --from 2026-10-01 --to 2026-10-31 --repo owner/name [--repo ...]
 as `label` and `description` options, plus an `orgs` grouping. `estimate.sh`
 prints the line items as JSON, or the review table with `--format table`.
 Both accept `--config` and `--projects-dir`.
+
+## FreshBooks
+
+```bash
+bin/store-secret.sh                    # in a terminal: hidden prompt, or the secret on stdin
+bin/login.sh [--no-open]
+bin/choices.sh
+bin/map.sh --repo owner/name --client <id> --project <id> --service <id>
+bin/unmapped.sh --repo owner/name [--repo ...]
+bin/estimate.sh --from ... --to ... --repo owner/name > lines.json
+bin/plan.sh --lines lines.json [--format table]
+bin/push.sh --lines lines.json --approve <code>
+```
+
+- The app needs the scopes `user:profile:read`, `user:projects:read`,
+  `user:clients:read`, `user:billable_items:read`, `user:time_entries:read` and
+  `user:time_entries:write`.
+- `login.sh` listens on the redirect URI with a throwaway self-signed
+  certificate, opens the approval page, and catches the code. The browser warns
+  once about the certificate. A callback whose `state` does not match is
+  rejected. The listener gives up after 5 minutes. The redirect host must be
+  `localhost` or `127.0.0.1`.
+- A refresh token works once. Each refresh saves the new refresh token to the
+  keychain before anything else, and a 401 triggers one refresh and one retry.
+  A 429 backs off, honoring `Retry-After`.
+- `choices.sh` prints the active clients, the projects and the active services
+  as `id`, `label` and `description` options. `map.sh` checks the ids against
+  FreshBooks before it saves them.
+- `plan.sh` turns each line into an entry: `is_logged` and `billable` true, a
+  duration of the billable hours in seconds, a `started_at` at the line's first
+  work on its local day, the mapped ids, and the label followed by the tag as
+  the note. It skips every line whose tag an existing entry's note carries, in
+  any case, and prints an approval code for the rest.
+- `push.sh` builds the plan again and creates the entries only when the code
+  matches, so a changed line set or a new FreshBooks entry needs a new review.
+  It stops at the first error, and prints which entries were created, which
+  failed and which were not attempted. It also stops when FreshBooks stores a
+  note without its tag, because a rerun could not detect that entry.
 
 ## How hours are counted
 

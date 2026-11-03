@@ -8,5 +8,10 @@
     "dr-john-h-watson[bot]",
     "mr-sherlock-holmes[bot]",
     "inspector-g-lestrade[bot]"
-  ]
+  ],
+  "freshbooks": {
+    "client_id": null,
+    "redirect_uri": "https://localhost:8080/callback",
+    "repos": {}
+  }
 }
