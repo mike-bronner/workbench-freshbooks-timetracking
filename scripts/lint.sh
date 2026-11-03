@@ -39,6 +39,10 @@ for f in "${modules[@]}"; do
   node --check "$f" || { echo "✗ syntax error: $f" >&2; fail=1; }
 done
 
+if ! bash scripts/check-skills.sh; then
+  fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "✗ lint failed" >&2
   exit 1

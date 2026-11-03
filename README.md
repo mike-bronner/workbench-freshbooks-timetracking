@@ -11,11 +11,24 @@ for a set of lines that was approved.
 - macOS, for the keychain, and `openssl` for the login listener
 - `shellcheck` and `jq` for `scripts/lint.sh`
 
+## Skills
+
+- `/workbench-freshbooks-timetracking:setup` creates the config, offers the
+  hour settings, walks through registering the FreshBooks app, saves the client
+  secret to the keychain through a hidden macOS dialog, and logs in. A rerun
+  keeps the config and the repo mappings, and redoes only the steps you pick.
+- `/workbench-freshbooks-timetracking:estimate` asks for a date range and the
+  repos, maps each unmapped repo, shows the review table, and runs `push.sh`
+  only after you approve that table.
+
+Both skills run the scripts below from the installed plugin. The scripts do
+every calculation and every FreshBooks call.
+
 ## Configuration
 
-Copy `assets/config.example.json` to
-`~/.config/workbench-freshbooks-timetracking/config.json`, or set `WBFT_CONFIG`
-to another path. The file holds no secrets.
+The setup skill, or `bin/init-config.sh`, copies `assets/config.example.json`
+to `~/.config/workbench-freshbooks-timetracking/config.json` when no config
+exists there. Set `WBFT_CONFIG` to use another path. The file holds no secrets.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -26,7 +39,7 @@ to another path. The file holds no secrets.
 | `authors` | required | GitHub logins whose PRs are billable; Apps as `slug[bot]` |
 | `freshbooks.client_id` | none | Client id of the FreshBooks app |
 | `freshbooks.redirect_uri` | `https://localhost:8080/callback` | Redirect URI registered on the app; HTTPS, no query string |
-| `freshbooks.business_id`, `freshbooks.account_id` | set by login | Business the entries go to; set `business_id` first if the login has several |
+| `freshbooks.business_id`, `freshbooks.account_id` | set by login | Business the entries go to; set `business_id` with `configure.sh` first if the login has several |
 | `freshbooks.repos` | `{}` | Lower-case `owner/name` to `{client_id, project_id, service_id}`, saved by `map.sh` |
 
 The client secret and the tokens live only in the macOS keychain, under the
@@ -48,8 +61,13 @@ Both accept `--config` and `--projects-dir`.
 ## FreshBooks
 
 ```bash
-bin/store-secret.sh                    # in a terminal: hidden prompt, or the secret on stdin
+bin/init-config.sh
+bin/configure.sh [--human-minutes-per-ai-hour n] [--idle-gap-minutes n] [--rounding-step-hours n]
+                 [--timezone zone|system] [--client-id id] [--redirect-uri url] [--business-id id]
+bin/status.sh
+bin/store-secret.sh [--dialog]         # hidden macOS dialog, hidden terminal prompt, or stdin
 bin/login.sh [--no-open]
+bin/range.sh
 bin/choices.sh
 bin/map.sh --repo owner/name --client <id> --project <id> --service <id>
 bin/unmapped.sh --repo owner/name [--repo ...]
@@ -58,6 +76,21 @@ bin/plan.sh --lines lines.json [--format table]
 bin/push.sh --lines lines.json --approve <code>
 ```
 
+- `configure.sh` validates each value before it saves it. A redirect URI must
+  use https on `localhost` or `127.0.0.1`. `--timezone system` follows the
+  machine zone.
+- `status.sh` prints the settings, the FreshBooks ids, the mapped repos, and
+  whether a client secret and a login are in the keychain, as true or false.
+  `timezone_follows_system` is true when the config names no zone, and false
+  when it pins one, even a zone equal to the system zone.
+- `scripts/check-skills.sh` checks each skill: closed frontmatter, a name
+  equal to its folder, a description, and scripts reached through
+  `${CLAUDE_PLUGIN_ROOT}/bin/`. `scripts/lint.sh` runs it.
+- `store-secret.sh --dialog` takes the secret from a macOS dialog with a hidden
+  field and pipes it to the keychain. A cancelled dialog saves nothing.
+- `range.sh` reads the FreshBooks entries of the last 366 days and prints
+  date-range choices: since the latest day a tag names, this month so far, and
+  last month.
 - The app needs the scopes `user:profile:read`, `user:projects:read`,
   `user:clients:read`, `user:billable_items:read`, `user:time_entries:read` and
   `user:time_entries:write`.
@@ -76,7 +109,9 @@ bin/push.sh --lines lines.json --approve <code>
   duration of the billable hours in seconds, a `started_at` at the line's first
   work on its local day, the mapped ids, and the label followed by the tag as
   the note. It skips every line whose tag an existing entry's note carries, in
-  any case, and prints an approval code for the rest.
+  any case, and prints an approval code for the rest. Its table groups the
+  entries by repo in order of first work, marks git-sourced lines, and lists
+  the skipped lines.
 - `push.sh` builds the plan again and creates the entries only when the code
   matches, so a changed line set or a new FreshBooks entry needs a new review.
   It stops at the first error, and prints which entries were created, which

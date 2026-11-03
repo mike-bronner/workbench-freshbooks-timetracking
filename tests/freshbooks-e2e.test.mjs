@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { get } from 'node:https';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
@@ -156,5 +156,46 @@ describe('freshbooks scripts', () => {
     assert.equal(await new Promise((resolve) => child.on('close', resolve)), 0);
     assert.equal(keychainItems()[`${SERVICE}/${SECRET_ACCOUNT}`], 'piped-secret-31');
     assert.doesNotMatch(out + readFileSync(`${store}.argv`, 'utf8'), /piped-secret-31/);
+  });
+
+  describe('secret dialog', () => {
+    const fakeOsascript = (body) => {
+      const dir = join(box.root, 'fakebin');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'osascript'), `#!/bin/sh\nprintf '%s\\n' "$@" > '${join(box.root, 'osascript.args')}'\n${body}\n`, { mode: 0o755 });
+      return { ...env, PATH: `${dir}:${process.env.PATH}` };
+    };
+    const runDialog = (dialogEnv) => {
+      const child = spawn('bash', [join(ROOT, 'bin', 'store-secret.sh'), '--dialog'], { env: { ...process.env, ...dialogEnv } });
+      let out = '';
+      child.stdout.on('data', (d) => { out += d; });
+      child.stderr.on('data', (d) => { out += d; });
+      child.stdin.end();
+      return new Promise((resolve) => child.on('close', (code) => resolve({ code, out })));
+    };
+
+    it('takes the secret from a hidden macOS dialog straight to the keychain', async () => {
+      const { code, out } = await runDialog(fakeOsascript("printf 'dialog-secret-58\\n'"));
+      assert.equal(code, 0, out);
+      assert.equal(keychainItems()[`${SERVICE}/${SECRET_ACCOUNT}`], 'dialog-secret-58');
+      assert.match(readFileSync(join(box.root, 'osascript.args'), 'utf8'), /with hidden answer/);
+      assert.doesNotMatch(out + readFileSync(`${store}.argv`, 'utf8'), /dialog-secret-58/);
+    });
+
+    it('saves nothing when the dialog is cancelled', async () => {
+      const { code } = await runDialog(fakeOsascript("echo 'execution error: User canceled. (-128)' >&2\nexit 1"));
+      assert.notEqual(code, 0);
+      assert.equal(keychainItems()[`${SERVICE}/${SECRET_ACCOUNT}`], CLIENT_SECRET);
+    });
+  });
+
+  it('creates the config from the example and reports the setup state through the scripts', async () => {
+    const fresh = join(box.root, 'new', 'config.json');
+    const created = await launch('init-config.sh', [], { ...env, WBFT_CONFIG: fresh }).done;
+    assert.deepEqual(JSON.parse(created.stdout), { config_path: fresh, created: true });
+    const configured = await launch('configure.sh', ['--client-id', CLIENT_ID], { ...env, WBFT_CONFIG: fresh }).done;
+    assert.equal(configured.code, 0, configured.stderr);
+    const status = JSON.parse((await launch('status.sh', [], { ...env, WBFT_CONFIG: fresh }).done).stdout);
+    assert.deepEqual([status.config_exists, status.freshbooks.client_id, status.client_secret_saved, status.logged_in], [true, CLIENT_ID, true, false]);
   });
 });

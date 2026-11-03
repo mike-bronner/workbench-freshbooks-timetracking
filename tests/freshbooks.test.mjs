@@ -10,7 +10,8 @@ import { apiBase, createClient, pickBusiness } from '../lib/freshbooks/api.mjs';
 import { run } from '../lib/freshbooks/cli.mjs';
 import { ACCESS_TOKEN, CLIENT_SECRET as SECRET_ACCOUNT, REFRESH_TOKEN, SERVICE, systemKeychain } from '../lib/freshbooks/keychain.mjs';
 import { waitForCode } from '../lib/freshbooks/login.mjs';
-import { localDate } from '../lib/time.mjs';
+import { lastBilledDate } from '../lib/freshbooks/plan.mjs';
+import { localDate, rangeChoices, zonedMidnight } from '../lib/time.mjs';
 import { CLIENT_ID, CLIENT_SECRET, fakeFreshbooks } from './lib/fake-freshbooks.mjs';
 import { TZ, at, config, sandbox } from './lib/fixtures.mjs';
 
@@ -362,6 +363,160 @@ describe('freshbooks', () => {
     it('reports which repos in a selection have no mapping', async () => {
       const out = JSON.parse(await cli('unmapped', '--repo', 'Acme/Widgets', '--repo', 'acme/gadgets'));
       assert.deepEqual(out, { mapped: [{ repo: 'Acme/Widgets', ...MAPPING }], unmapped: ['acme/gadgets'] });
+    });
+  });
+
+  describe('review table', () => {
+    it('groups by repo in order of first work, marks git lines, and lists skipped entries', async () => {
+      updateConfig(configPath, (raw) => {
+        raw.freshbooks.repos['acme/gadgets'] = { client_id: 6, project_id: 41, service_id: 9 };
+      });
+      const lines = [
+        { ...line({ date: '2026-10-13', repo: 'acme/gadgets', first: '2026-10-13 09:00:00' }), source: 'git' },
+        { ...line({ date: '2026-10-15', pr: 4, hours: 0.5 }), source: 'session' },
+        { ...line({ date: '2026-10-12', first: '2026-10-12 08:00:00' }), source: 'session' },
+        { ...line({ date: '2026-10-16' }), source: 'session' },
+      ];
+      server.state.entries.push({ id: 501, started_at: at('2026-10-16 10:00:00'), note: 'General development [wbi:acme/widgets:2026-10-16]' });
+      const table = await cli('plan', '--lines', linesFile(lines), '--format', 'table');
+      const widgets = table.indexOf('## acme/widgets');
+      const gadgets = table.indexOf('## acme/gadgets');
+      assert.ok(widgets !== -1 && gadgets !== -1 && widgets < gadgets, table);
+      const widgetRows = table.slice(widgets, gadgets).split('\n').filter((r) => r.startsWith('| 2026'));
+      assert.deepEqual(widgetRows.map((r) => r.slice(2, 12)), ['2026-10-12', '2026-10-15']);
+      assert.ok(widgetRows.every((r) => r.includes('| session |')));
+      assert.match(table.slice(gadgets), /\| 2026-10-13 \| .* \| 0\.25 \| git \(fallback\) \| 6 \| 41 \| 9 \|/);
+      assert.match(table.slice(widgets, gadgets), /\| \| \*\*Total\*\* \| 0\.75 \|/);
+      assert.match(table, /To create: 3 entries, 1\.00 h\./);
+      assert.match(table, /Already in FreshBooks, skipped:\n\n- General development `\[wbi:acme\/widgets:2026-10-16\]` \(entry 501\)/);
+      assert.match(table, /Approval code: [0-9a-f]{16}/);
+    });
+  });
+
+  describe('range', () => {
+    const range = async (now) => JSON.parse(await run(['range', '--config', configPath], { keychain, base: server.url, log: () => {}, now: () => Date.parse(now) }));
+
+    it('starts the default range at the latest tagged day in FreshBooks', async () => {
+      server.state.entries.push(
+        { id: 1, started_at: at('2026-10-20 09:00:00'), note: 'PR #3: Work [wbi:acme/widgets#3:2026-10-20]' },
+        { id: 2, started_at: at('2026-10-22 09:00:00'), note: 'General [WBI:Acme/Widgets:2026-10-22]' },
+        { id: 3, started_at: at('2026-10-25 09:00:00'), note: 'A meeting I logged by hand' },
+      );
+      const out = await range('2026-11-03T18:00:00Z');
+      assert.deepEqual(out, {
+        today: '2026-11-03',
+        last_billed: '2026-10-22',
+        choices: [
+          { label: 'Since last billed', description: '2026-10-22 to 2026-11-03', from: '2026-10-22', to: '2026-11-03' },
+          { label: 'This month so far', description: '2026-11-01 to 2026-11-03', from: '2026-11-01', to: '2026-11-03' },
+          { label: 'Last month', description: '2026-10-01 to 2026-10-31', from: '2026-10-01', to: '2026-10-31' },
+        ],
+      });
+      const query = new URL(server.state.log.find((r) => r.path.endsWith('/time_entries')).url, 'http://x').searchParams;
+      assert.equal(query.get('started_from'), new Date(zonedMidnight('2025-11-02', TZ)).toISOString());
+      assert.equal(query.get('started_to'), new Date(zonedMidnight('2026-11-04', TZ)).toISOString());
+    });
+
+    it('offers no since-last-billed range when no entry carries a tag, and uses the config timezone for today', async () => {
+      server.state.entries.push({ id: 3, started_at: at('2026-10-25 09:00:00'), note: 'A meeting I logged by hand' });
+      const out = await range('2026-11-01T05:00:00Z');
+      assert.equal(out.today, '2026-10-31');
+      assert.equal(out.last_billed, null);
+      assert.deepEqual(out.choices.map((c) => c.label), ['This month so far', 'Last month']);
+      assert.deepEqual(out.choices[1], { label: 'Last month', description: '2026-09-01 to 2026-09-30', from: '2026-09-01', to: '2026-09-30' });
+    });
+
+    it('rolls last month back over a year end and never starts after today', () => {
+      assert.deepEqual(rangeChoices('2026-01-05', '2026-02-01').choices.map((c) => [c.from, c.to]), [
+        ['2026-01-05', '2026-01-05'], ['2026-01-01', '2026-01-05'], ['2025-12-01', '2025-12-31'],
+      ]);
+    });
+
+    it('reads the latest tag date across several tags in one note', () => {
+      assert.equal(lastBilledDate([{ note: 'x [wbi:a/b:2026-01-02] [wbi:a/b#4:2026-03-01]' }, { note: null }, {}]), '2026-03-01');
+      assert.equal(lastBilledDate([{ note: '[wbi:a/b:2026-02-30]' }]), null);
+    });
+  });
+
+  describe('setup', () => {
+    it('copies the example config only when none exists', async () => {
+      const fresh = join(box.root, 'nested', 'dir', 'config.json');
+      const first = JSON.parse(await run(['init', '--config', fresh], { keychain }));
+      assert.deepEqual(first, { config_path: fresh, created: true });
+      const example = readFileSync(new URL('../assets/config.example.json', import.meta.url), 'utf8');
+      assert.equal(readFileSync(fresh, 'utf8'), example);
+      writeFileSync(fresh, '{"edited":true}');
+      assert.deepEqual(JSON.parse(await run(['init', '--config', fresh], { keychain })), { config_path: fresh, created: false });
+      assert.equal(readFileSync(fresh, 'utf8'), '{"edited":true}');
+    });
+
+    it('saves the settings, client id and redirect URI, and keeps the mappings and business', async () => {
+      const out = JSON.parse(await cli('configure', '--human-minutes-per-ai-hour', '30', '--idle-gap-minutes', '10',
+        '--rounding-step-hours', '0.5', '--timezone', 'Europe/Berlin', '--client-id', 'client-xyz', '--redirect-uri', 'https://127.0.0.1:9443/cb', '--business-id', '78'));
+      assert.deepEqual(out.saved, {
+        human_minutes_per_ai_hour: 30, idle_gap_minutes: 10, rounding_step_hours: 0.5, timezone: 'Europe/Berlin',
+        freshbooks: { client_id: 'client-xyz', redirect_uri: 'https://127.0.0.1:9443/cb', business_id: 78 },
+      });
+      const saved = JSON.parse(readFileSync(configPath, 'utf8'));
+      assert.equal(saved.idle_gap_minutes, 10);
+      assert.deepEqual(saved.freshbooks, { client_id: 'client-xyz', redirect_uri: 'https://127.0.0.1:9443/cb', business_id: 78, account_id: 'acct9', repos: { 'acme/widgets': MAPPING } });
+      await cli('configure', '--timezone', 'system');
+      assert.equal(JSON.parse(readFileSync(configPath, 'utf8')).timezone, null);
+    });
+
+    it('refuses a bad value and leaves the config alone', async () => {
+      const before = readFileSync(configPath, 'utf8');
+      await assert.rejects(cli('configure'), /at least one setting/);
+      await assert.rejects(cli('configure', '--idle-gap-minutes', 'ten'), /--idle-gap-minutes must be a number/);
+      await assert.rejects(cli('configure', '--idle-gap-minutes', ' '), /--idle-gap-minutes must be a number/);
+      await assert.rejects(cli('configure', '--rounding-step-hours=-1'), /rounding_step_hours must be a positive number/);
+      await assert.rejects(cli('configure', '--timezone', 'Mars/Base'), /not a valid IANA zone/);
+      await assert.rejects(cli('configure', '--client-id', 'two words'), /--client-id must be one word/);
+      await assert.rejects(cli('configure', '--business-id', 'abc'), /--business-id must be a positive integer/);
+      await assert.rejects(cli('configure', '--redirect-uri', 'https://example.com/callback'), /must be on localhost or 127\.0\.0\.1/);
+      await assert.rejects(cli('configure', '--redirect-uri', 'not a url'), /must be on localhost or 127\.0\.0\.1/);
+      await assert.rejects(cli('configure', '--redirect-uri', 'http://localhost:8080/callback'), /must be an https URL/);
+      await assert.rejects(cli('configure', '--redirect-uri', 'https://localhost:8080/callback?x=1'), /must be an https URL/);
+      assert.equal(readFileSync(configPath, 'utf8'), before);
+    });
+
+    it('reports the setup state without a secret or token', async () => {
+      const out = await cli('status');
+      assert.deepEqual(JSON.parse(out), {
+        config_path: configPath,
+        config_exists: true,
+        settings: { human_minutes_per_ai_hour: 20, idle_gap_minutes: 15, rounding_step_hours: 0.25, timezone: TZ, timezone_follows_system: false },
+        freshbooks: { client_id: CLIENT_ID, redirect_uri: 'https://localhost:8080/callback', business_id: 77, account_id: 'acct9', mapped_repos: ['acme/widgets'] },
+        system_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        client_secret_saved: true,
+        logged_in: true,
+      });
+      for (const value of Object.values(keychain.items)) assert.ok(!out.includes(value));
+    });
+
+    it('tells a pinned timezone from one that follows the machine, even when both name the same zone', async () => {
+      const system = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      await cli('configure', '--timezone', system);
+      const pinned = JSON.parse(await cli('status')).settings;
+      assert.deepEqual([pinned.timezone, pinned.timezone_follows_system], [system, false]);
+      await cli('configure', '--timezone', 'system');
+      const following = JSON.parse(await cli('status')).settings;
+      assert.deepEqual([following.timezone, following.timezone_follows_system], [system, true]);
+      updateConfig(configPath, (raw) => {
+        delete raw.timezone;
+      });
+      assert.equal(JSON.parse(await cli('status')).settings.timezone_follows_system, true);
+    });
+
+    it('reports a missing config, a missing secret and no login', async () => {
+      const empty = memoryKeychain(events);
+      const missing = join(box.root, 'none.json');
+      assert.deepEqual(JSON.parse(await run(['status', '--config', missing], { keychain: empty })), {
+        config_path: missing, config_exists: false, client_secret_saved: false, logged_in: false,
+      });
+      empty.items[SECRET_ACCOUNT] = 'x';
+      const partial = JSON.parse(await run(['status', '--config', configPath], { keychain: empty }));
+      assert.deepEqual([partial.client_secret_saved, partial.logged_in], [true, false]);
     });
   });
 
