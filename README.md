@@ -9,7 +9,7 @@ for a set of lines that was approved.
 
 - `node` 20 or later, `git`, and `gh` signed in to GitHub
 - macOS, for the keychain, and `openssl` for the login listener
-- `shellcheck` and `jq` for `scripts/lint.sh`
+- `shellcheck`, `jq` and `ruby` for `scripts/lint.sh`
 
 ## Skills
 

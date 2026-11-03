@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-for tool in shellcheck jq git node; do
+for tool in shellcheck jq git node ruby; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "✗ $tool not found on PATH — required by the lint gate" >&2
     exit 1
@@ -30,6 +30,13 @@ if [ "${#json_files[@]}" -eq 0 ]; then
 fi
 for f in "${json_files[@]}"; do
   jq empty "$f" || { echo "✗ invalid JSON: $f" >&2; fail=1; }
+done
+
+yaml_files=()
+while IFS= read -r f; do yaml_files+=("$f"); done < <(git ls-files --cached --others --exclude-standard -- '*.yml' '*.yaml')
+echo "▶ ruby yaml: ${#yaml_files[@]} YAML file(s)"
+for f in "${yaml_files[@]}"; do
+  ruby -ryaml -e 'YAML.load_file(ARGV[0])' "$f" || { echo "✗ invalid YAML: $f" >&2; fail=1; }
 done
 
 modules=()
