@@ -1,6 +1,6 @@
 ---
 name: estimate
-description: Turn a date range of AI development work into FreshBooks time entries. Asks for the range and the repos, maps unmapped repos to a FreshBooks client, project, hourly service and optional flat-rate service, shows the review table, lets Mike mark PRs as flat-rate, and creates the entries only after Mike approves that exact table.
+description: Turn a date range of AI development work into FreshBooks time entries. Asks for the range and the repos, maps unmapped repos to a FreshBooks client, project, hourly service and optional flat-rate service, shows the review table, lets Mike mark PRs, issues and general days as flat-rate, and creates new entries and corrects existing ones only after Mike approves that exact table.
 ---
 
 # Estimate and push FreshBooks time entries
@@ -19,7 +19,7 @@ only asks, shows and confirms.
 - Put every decision to Mike through AskUserQuestion. Never ask in prose.
 - Give every question 2 to 4 options. Steps 3 and 4 say how to ask a list of
   one item, and how to split a longer list. Step 7 uses the same rules for
-  PRs.
+  flat-rate marks.
 - No step needs the client secret or a token. Never ask for one, show one or
   pass one.
 - Pass a value Mike typed to a script in single quotes. A date must look like
@@ -31,11 +31,11 @@ only asks, shows and confirms.
 
 ## The approval rule
 
-`push.sh` creates FreshBooks entries. Run it only under all of these
-conditions:
+`push.sh` creates FreshBooks entries and updates existing ones. Run it only
+under all of these conditions:
 
 1. You showed Mike the review table from `plan.sh` in this run.
-2. Right after that table, Mike picked "Create these entries" in an
+2. Right after that table, Mike picked "Apply these changes" in an
    AskUserQuestion.
 3. You pass the approval code printed in that same table, and the same lines
    file that `plan.sh` read.
@@ -159,8 +159,9 @@ Map the unmapped repos one at a time. For each repo:
    any, and every service when it has none. If the client has no project, tell
    Mike and ask him to pick another client or to stop.
 3. Ask "Does `<repo>` have a flat-rate service?" with the options "Yes" and
-   "No". The description of "Yes" says that PRs Mike marks as flat-rate are
-   logged there as non-billable entries. The description of "No" says that
+   "No". The description of "Yes" says that lines Mike marks as flat-rate are
+   logged there as billable entries at that service's rate, so a $0 service
+   shows them on the invoice at $0. The description of "No" says that
    every line is billed hourly until a flat-rate service is mapped. On "Yes",
    ask "Which service is for flat-rate work on `<repo>`?", offering the same
    services as for the hourly service, without the hourly one. If none is
@@ -199,66 +200,79 @@ bash "${CLAUDE_PLUGIN_ROOT}/bin/estimate.sh" --from '<from>' --to '<to>' --repo 
 bash "${CLAUDE_PLUGIN_ROOT}/bin/plan.sh" --lines '<lines file>' --format table
 ```
 
-The plan table has one section per repo, in order of first work, with a total
-per repo. Each line shows:
+The plan table has one section per repo with the entries to create, in order
+of first work, with a total per repo. Each line shows:
 
-- Its Rate: "hourly", or "flat-rate (saved mark)" when Mike marked its PR as
-  flat-rate in this run or an earlier one. A flat-rate line is created as a
-  non-billable entry under the repo's flat-rate service.
+- Its Rate: "hourly", or "flat-rate (saved mark)" when Mike marked its PR,
+  issue or general day as flat-rate in this run or an earlier one. Every
+  entry is billable. A flat-rate line goes under the repo's flat-rate service,
+  so its price comes from that service's rate.
 - Its Source: "git (fallback)" for a line that comes from git commit times.
 - Its Service id, or "none" for a flat-rate line in a repo that has no
   flat-rate service.
 
-A "To create" line gives the number of entries, their hours, and how those
-hours split into billable hourly hours and non-billable flat-rate hours. A list
-shows the lines that FreshBooks already holds, which the push skips. The last
-line is the approval code. When a repo has flat-rate lines but no flat-rate
-service, the table instead ends with a "Cannot create" line per repo and "No
-approval code until every flat-rate line has a service."
+A section "Existing entries to update" follows when FreshBooks holds tagged
+entries whose billable flag or service differs from what the plan would create
+now. Each row shows the entry id and, for both fields, the old and new value
+or "unchanged". An update changes only those two fields, never the duration,
+the date or the note.
 
-Copy the whole table into your reply, unchanged. If it says "Nothing new to
-create.", tell Mike that every line is already in FreshBooks, and stop.
+A "To create" line gives the number of new entries, their hours, and how those
+hours split into hourly and flat-rate hours. A "To update" line gives the
+number of existing entries to change. A list shows the entries that FreshBooks
+already holds unchanged, which the push skips. The last line is the approval
+code. When the plan cannot go ahead, the table instead ends with one "Cannot
+create" or "Cannot update" line per problem, and "No approval code until every
+"Cannot" line above is fixed."
+
+Copy the whole table into your reply, unchanged. If it says "Nothing to create
+or update.", tell Mike that FreshBooks already holds every line as planned,
+and stop.
 
 ## Step 6: Ask for approval
 
-When the table ends with an approval code, ask right after the table: "Create
-these entries in FreshBooks?" Use the numbers from the "To create" line in the
-question. The options are:
+When the table ends with an approval code, ask right after the table: "Apply
+these changes in FreshBooks?" Use the numbers from the "To create" and "To
+update" lines in the question. The options are:
 
-- "Create these entries": the description says it creates exactly the entries
-  in the table above, under approval code `<code>`.
+- "Apply these changes": the description says it creates and updates exactly
+  the entries in the table above, under approval code `<code>`.
 - "Change flat-rate marks": go to step 7.
 - "Change the selection": go back to step 3 with the same range.
-- "Stop": create nothing.
+- "Stop": create and update nothing.
 
 When the table has no approval code, ask right after the table: "How do you
-want to fix the flat-rate lines?" Name the repos of the "Cannot create" lines
-in the question. The options are:
+want to fix the "Cannot" lines?" Name the repos of the "Cannot" lines in the
+question. The options are:
 
-- "Map a flat-rate service": go to step 8.
+- "Map a flat-rate service": offer it only when a "Cannot create" or "Cannot
+  update" line says that a repo has no flat-rate service. Go to step 8.
 - "Change flat-rate marks": go to step 7.
 - "Change the selection": go back to step 3 with the same range.
-- "Stop": create nothing.
+- "Stop": create and update nothing.
 
-Every pick but "Create these entries" voids the current code.
+Every pick but "Apply these changes" voids the current code.
 
-Only on "Create these entries", run:
+Only on "Apply these changes", run:
 
 ```bash
 bash "${CLAUDE_PLUGIN_ROOT}/bin/push.sh" --lines '<lines file>' --approve '<code from the table>'
 ```
 
-`push.sh` builds the plan again and creates nothing when the code does not
-match. If it exits with "the approval code does not match", FreshBooks, the
+`push.sh` builds the plan again, and creates and updates nothing when the code
+does not match. If it exits with "the approval code does not match", FreshBooks, the
 lines or a flat-rate mark changed since the table. Do not pass any other code.
 Run `plan.sh` again, show the new table and ask again in this step. Then go to
 step 9.
 
 ## Step 7: Change flat-rate marks
 
-A mark belongs to a PR, not to one day. It applies to every line of that PR,
-in this run and in every later run, until Mike clears it. Only PR lines can be
-flat-rate.
+A mark applies in this run and in every later run, until Mike clears it. A
+mark has one of three kinds:
+
+- A PR mark covers every line of that PR.
+- An issue mark covers every issue line of that issue.
+- A general mark covers the general line of one repo on one day.
 
 Run:
 
@@ -266,41 +280,46 @@ Run:
 bash "${CLAUDE_PLUGIN_ROOT}/bin/flat-rate.sh" --lines '<lines file>'
 ```
 
-It prints `pull_requests`, one per PR in the lines file, with `ref`
-(`owner/name#number`), `label`, `flat_rate` (true when a saved mark applies)
-and `description`. If the list is empty, tell Mike that no line in this range
-belongs to a PR. Then run `plan.sh` again as in step 5, show the table and ask
-again in step 6.
+It prints `items`, one per PR, issue and general day in the lines file. Each
+item has these fields:
+
+- `ref`: `owner/name#number` for a PR or an issue, and `owner/name:YYYY-MM-DD`
+  for a general day.
+- `kind`: `pr`, `issue` or `general`.
+- `label`, and `flat_rate`, which is true when a saved mark applies.
+- `description`.
 
 Ask "Which flat-rate marks do you want to change?" with these options:
 
-- "Mark PRs as flat-rate": offer it only when a PR has `flat_rate` false. The
-  description names how many PRs are hourly.
-- "Clear flat-rate marks": offer it only when a PR has `flat_rate` true. The
-  description names how many PRs are marked.
+- "Mark as flat-rate": offer it only when an item has `flat_rate` false. The
+  description names how many items are hourly.
+- "Clear flat-rate marks": offer it only when an item has `flat_rate` true.
+  The description names how many items are marked.
 - "Back to the table": change nothing.
 
-For "Mark PRs as flat-rate", the list is the PRs with `flat_rate` false. For
-"Clear flat-rate marks", it is the PRs with `flat_rate` true. Ask that list in
-the printed order, through the two forms of step 3:
+For "Mark as flat-rate", the list is the items with `flat_rate` false. For
+"Clear flat-rate marks", it is the items with `flat_rate` true. Ask that list
+in the printed order, through the two forms of step 3:
 
-- One PR: ask "Mark `<ref>` as flat-rate?" or "Clear the flat-rate mark of
+- One item: ask "Mark `<ref>` as flat-rate?" or "Clear the flat-rate mark of
   `<ref>`?" with the options "Yes" and "No".
-- Two or more PRs: ask them in batches, with `multiSelect` true, under the
-  batch rules of step 3. Head each question with its place, such as "PRs 1 to
-  4 of 9". Each option has the `ref` as label, and the `label` and
+- Two or more items: ask them in batches, with `multiSelect` true, under the
+  batch rules of step 3. Head each question with its place, such as "Items 1
+  to 4 of 9". Each option has the `ref` as label, and the `label` and
   `description` from the script as description. Other with "none" skips the
-  batch. Other may also name a PR as `owner/name#number`. Keep a typed PR only
-  when it is in the list you asked, and tell Mike which typed PRs you dropped.
+  batch. Other may also name an item by its `ref`. Keep a typed item only
+  when it is in the list you asked, and tell Mike which typed items you
+  dropped.
 
-Then save all picks in one run, with one `--mark` or `--clear` per picked PR:
+Then save all picks in one run, with one `--mark` or `--clear` per picked
+item:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/bin/flat-rate.sh" --lines '<lines file>' --mark '<owner/name#number>' --mark '<owner/name#number>'
+bash "${CLAUDE_PLUGIN_ROOT}/bin/flat-rate.sh" --lines '<lines file>' --mark '<owner/name#number>' --mark '<owner/name:YYYY-MM-DD>'
 bash "${CLAUDE_PLUGIN_ROOT}/bin/flat-rate.sh" --lines '<lines file>' --clear '<owner/name#number>'
 ```
 
-If Mike picked nothing, save nothing. If the script refuses a PR, show its
+If Mike picked nothing, save nothing. If the script refuses an item, show its
 reason. It saves nothing in that case, so ask the list again.
 
 On "Back to the table" and after a save, run `plan.sh` with `--format table`
@@ -309,8 +328,8 @@ approval code no longer counts.
 
 ## Step 8: Map a flat-rate service
 
-For each repo named in a "Cannot create" line, run `unmapped.sh` with that
-repo. It prints the repo under `mapped`, with its `client_id`, `project_id`
+For each repo that a "Cannot" line says has no flat-rate service, run
+`unmapped.sh` with that repo. It prints the repo under `mapped`, with its `client_id`, `project_id`
 and `service_id`. Run `bash "${CLAUDE_PLUGIN_ROOT}/bin/choices.sh"` once.
 
 Ask "Which service is for flat-rate work on `<repo>`?", with the single-pick
@@ -332,18 +351,25 @@ new table and ask again in step 6.
 
 ## Step 9: Report the result
 
-`push.sh` prints JSON with `created`, `skipped`, `failed` and `not_attempted`.
-It prints the same JSON when it stops at an error.
+`push.sh` prints JSON with `created`, `updated`, `skipped`, `failed` and
+`not_attempted`. It prints the same JSON when it stops at an error. It creates
+the new entries first, then updates the existing ones.
 
-Lead with the outcome in one sentence: how many entries were created, and
-whether the push finished. Then:
+Lead with the outcome in one sentence: how many entries were created and
+updated, and whether the push finished. Then:
 
 - Name the skipped lines when there are any.
-- When `failed` is set, name its tag and error. Its `created` field says
-  whether that entry exists:
+- When `failed` is set, name its tag and error. Its `action` is `create` or
+  `update`.
+- For `create`, its `created` field says whether that entry exists:
   - `no`: FreshBooks refused it, and a rerun of this skill tries it again.
   - `unknown`: Mike checks FreshBooks for that entry before a rerun.
   - `yes`: the entry exists but its note lost the tag. Mike fixes the note in
     FreshBooks before a rerun, or the rerun creates it twice.
+- For `update`, its `changed` field says whether entry `id` may have changed:
+  - `no`: FreshBooks refused the change, and a rerun tries it again.
+  - `unknown`: the entry may have changed. A rerun lists it under "Existing
+    entries to update" again only if it still differs.
 - List the `not_attempted` tags, and say that a rerun of this skill picks them
-  up, because the push skips every entry that already exists.
+  up, because the plan skips every entry that FreshBooks already holds as
+  planned.

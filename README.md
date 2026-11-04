@@ -19,8 +19,8 @@ for a set of lines that was approved.
   keeps the config and the repo mappings, and redoes only the steps you pick.
 - `/workbench-freshbooks-timetracking:estimate` asks for a date range and the
   repos, maps each unmapped repo to an hourly and an optional flat-rate
-  service, shows the review table, lets you mark PRs as flat-rate, and runs
-  `push.sh` only after you approve that table.
+  service, shows the review table, lets you mark PRs, issues and general days
+  as flat-rate, and runs `push.sh` only after you approve that table.
 
 Both skills run the scripts below from the installed plugin. The scripts do
 every calculation and every FreshBooks call.
@@ -43,6 +43,8 @@ exists there. Set `WBFT_CONFIG` to use another path. The file holds no secrets.
 | `freshbooks.business_id`, `freshbooks.account_id` | set by login | Business the entries go to; set `business_id` with `configure.sh` first if the login has several |
 | `freshbooks.repos` | `{}` | Lower-case `owner/name` to `{client_id, project_id, service_id}`, plus an optional `flat_rate_service_id`, saved by `map.sh`; `service_id` is the hourly service |
 | `freshbooks.flat_rate_prs` | `{}` | Lower-case `owner/name` to the PR numbers marked flat-rate, saved by `flat-rate.sh` |
+| `freshbooks.flat_rate_issues` | `{}` | Lower-case `owner/name` to the issue numbers marked flat-rate, saved by `flat-rate.sh` |
+| `freshbooks.flat_rate_days` | `{}` | Lower-case `owner/name` to the `YYYY-MM-DD` days whose general line is flat-rate, saved by `flat-rate.sh` |
 
 The client secret and the tokens live only in the macOS keychain, under the
 service `workbench-freshbooks-timetracking`. No script prints them, and none
@@ -74,7 +76,7 @@ bin/choices.sh
 bin/map.sh --repo owner/name --client <id> --project <id> --service <id> [--flat-rate-service <id>]
 bin/unmapped.sh --repo owner/name [--repo ...]
 bin/estimate.sh --from ... --to ... --repo owner/name > lines.json
-bin/flat-rate.sh --lines lines.json [--mark owner/name#pr ...] [--clear owner/name#pr ...]
+bin/flat-rate.sh --lines lines.json [--mark owner/name#number|owner/name:YYYY-MM-DD ...] [--clear ...]
 bin/plan.sh --lines lines.json [--format table]
 bin/push.sh --lines lines.json --approve <code>
 ```
@@ -111,29 +113,48 @@ bin/push.sh --lines lines.json --approve <code>
   as `id`, `label` and `description` options. `map.sh` checks the ids against
   FreshBooks before it saves them, and refuses a flat-rate service equal to
   the hourly one.
-- `flat-rate.sh` lists the PRs of a lines file and whether a saved mark makes
-  each one flat-rate. `--mark` saves a mark for a PR in the file, and `--clear`
-  removes a saved mark. A mark covers every line of its PR, in every later
-  run, until it is cleared. Issue and general lines are always hourly.
+- `flat-rate.sh` lists the PRs, issues and general days of a lines file, and
+  whether a saved mark makes each one flat-rate. `--mark` saves a mark for an
+  item in the file, and `--clear` removes a saved mark. An item is
+  `owner/name#number` for a PR or an issue, and `owner/name:YYYY-MM-DD` for
+  the general line of one repo on one day. A PR mark covers every line of its
+  PR, and an issue mark every issue line of its issue. A mark holds in every
+  later run, until it is cleared.
 - `plan.sh` turns each line into an entry: `is_logged` true, a duration of the
   billable hours in seconds, a `started_at` at the line's first work on its
   local day, the mapped client and project, and the label followed by the tag
-  as the note. An hourly line is billable under the repo's `service_id`. A
-  flat-rate line is non-billable under its `flat_rate_service_id`. It skips
-  every line whose tag an existing entry's note carries, in any case, and
-  prints an approval code for the rest. The code covers each entry's billable
-  flag and service, so a changed mark needs a new review. When a repo has
-  flat-rate lines to create but no flat-rate service, the plan has no code and
-  says why. Its table groups the entries by repo in order of first work, shows
-  the rate of each line, marks git-sourced lines, splits billable from
-  non-billable hours, and lists the skipped lines.
-- `push.sh` builds the plan again and creates the entries only when the code
-  matches, so a changed line set, a changed mark or a new FreshBooks entry
-  needs a new review. It creates nothing while a repo lacks a flat-rate
-  service it needs.
+  as the note. Every entry is billable. An hourly line goes under the repo's
+  `service_id`, and a flat-rate line under its `flat_rate_service_id`, so a
+  $0 flat-rate service shows the line on the invoice at $0.
+- `plan.sh` compares each entry whose note carries a line's tag, in any case,
+  with what it would create for that line. When the billable flag or the
+  service differs, it lists the entry to update, with the old and new values.
+  An update never touches the duration, the date or the note, and never an
+  entry without a tag. Every other tagged entry is skipped. The plan prints
+  one approval code that covers each new entry and each update, so a changed
+  mark or a changed FreshBooks entry needs a new review.
+- The plan has no code, and says why, in any of these cases:
+  - A repo has flat-rate lines, new or already in FreshBooks, but no
+    flat-rate service.
+  - The FreshBooks list leaves out `billable`, `service_id`, `duration` or
+    `started_at` for a tagged entry, so the plan cannot compare it.
+  - An update has no valid entry id.
+  - One entry carries the tags of more than one line.
+- The plan table groups the new entries by repo in order of first work, shows
+  the rate of each line, marks git-sourced lines, and splits hourly from
+  flat-rate hours. A separate section lists the updates, and a list names the
+  unchanged entries.
+- `push.sh` builds the plan again, and creates and updates entries only when
+  the code matches, so a changed line set, a changed mark or a changed
+  FreshBooks entry needs a new review. It changes nothing while the plan has
+  no code. It creates the new entries first, then sends each update as a PUT
+  with only the changed keys. It stops when the PUT response does not show the
+  new values, or shows a duration, date or note other than the listed one.
   It stops at the first error, and prints which entries were created, which
-  failed and which were not attempted. It also stops when FreshBooks stores a
-  note without its tag, because a rerun could not detect that entry.
+  were updated, which were skipped, which failed and which were not attempted.
+  A failed update says whether the entry may have changed. It also stops when
+  FreshBooks stores a note without its tag, because a rerun could not detect
+  that entry.
 
 ## How hours are counted
 

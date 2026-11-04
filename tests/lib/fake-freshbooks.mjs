@@ -90,6 +90,12 @@ export async function fakeFreshbooks({ events = [], redirectUri = 'https://local
       state.entries.push(entry);
       return [200, { time_entry: entry }];
     }],
+    ['PUT', /^\/timetracking\/business\/77\/time_entries\/\d+$/, (url, body) => {
+      const entry = state.entries.find((e) => e.id === Number(url.pathname.split('/').at(-1)));
+      if (!entry) return [404, { error: 'no entry' }];
+      Object.assign(entry, body.time_entry);
+      return [200, { time_entry: entry }];
+    }],
   ];
 
   const server = createServer(async (req, res) => {
@@ -119,6 +125,7 @@ export async function fakeFreshbooks({ events = [], redirectUri = 'https://local
     state,
     url: `http://127.0.0.1:${server.address().port}`,
     posts: () => state.log.filter((r) => r.method === 'POST' && r.path.includes('time_entries')),
+    puts: () => state.log.filter((r) => r.method === 'PUT'),
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }

@@ -13,7 +13,7 @@ import { apiBase, createClient, pickBusiness } from '../lib/freshbooks/api.mjs';
 import { run } from '../lib/freshbooks/cli.mjs';
 import { ACCESS_TOKEN, CLIENT_SECRET as SECRET_ACCOUNT, REFRESH_TOKEN, SERVICE, systemKeychain } from '../lib/freshbooks/keychain.mjs';
 import { selfSignedCert, waitForCode } from '../lib/freshbooks/login.mjs';
-import { lastBilledDate } from '../lib/freshbooks/plan.mjs';
+import { approvalCode, lastBilledDate, push as pushPlan } from '../lib/freshbooks/plan.mjs';
 import { localDate, rangeChoices, zonedMidnight } from '../lib/time.mjs';
 import { CLIENT_ID, CLIENT_SECRET, fakeFreshbooks } from './lib/fake-freshbooks.mjs';
 import { TZ, at, config, sandbox } from './lib/fixtures.mjs';
@@ -160,12 +160,13 @@ describe('freshbooks', () => {
   describe('dedup', () => {
     it('skips a line whose tag an existing note carries, ignoring case', async () => {
       server.state.entries.push(
-        { id: 501, started_at: '2026-10-14T17:00:00.000Z', note: 'Billed by hand [WBI:Acme/Widgets#12:2026-10-14]' },
-        { id: 502, started_at: '2026-10-14T18:00:00.000Z', note: 'Near miss [wbi:acme/widgets#123:2026-10-14]' },
+        { id: 501, started_at: '2026-10-14T17:00:00.000Z', note: 'Billed by hand [WBI:Acme/Widgets#12:2026-10-14]', billable: true, service_id: 9, duration: 900 },
+        { id: 502, started_at: '2026-10-14T18:00:00.000Z', note: 'Near miss [wbi:acme/widgets#123:2026-10-14]', billable: false, service_id: 11, duration: 900 },
       );
       const lines = [line({ date: '2026-10-14', pr: 12 }), line({ date: '2026-10-14', pr: 1 }), line({ date: '2026-10-14' })];
       const result = await plan(lines);
-      assert.deepEqual(result.skip, [{ tag: '[wbi:acme/widgets#12:2026-10-14]', label: 'PR #12: Work', existing_id: 501 }]);
+      assert.deepEqual(result.skip, [{ tag: '[wbi:acme/widgets#12:2026-10-14]', label: 'PR #12: Work', rate: 'hourly', existing_id: 501 }]);
+      assert.deepEqual(result.update, []);
       assert.deepEqual(result.create.map((e) => e.tag), [lines[1].tag, lines[2].tag]);
     });
 
@@ -182,7 +183,7 @@ describe('freshbooks', () => {
 
     it('reads every page of existing entries, with no Content-Type on a GET', async () => {
       for (let i = 0; i < 150; i++) server.state.entries.push({ id: i, started_at: '2026-10-14T15:00:00.000Z', note: `other ${i}` });
-      server.state.entries.push({ id: 900, started_at: '2026-10-14T16:00:00.000Z', note: 'x [wbi:acme/widgets:2026-10-14]' });
+      server.state.entries.push({ id: 900, started_at: '2026-10-14T16:00:00.000Z', note: 'x [wbi:acme/widgets:2026-10-14]', billable: true, service_id: 9, duration: 900 });
       const result = await plan([line({ date: '2026-10-14' })]);
       assert.deepEqual(result.skip.map((s) => s.existing_id), [900]);
       const gets = server.state.log.filter((r) => r.method === 'GET');
@@ -194,7 +195,7 @@ describe('freshbooks', () => {
     it('reads until a short page when the response carries no page count', async () => {
       server.state.omitPages = true;
       for (let i = 0; i < 150; i++) server.state.entries.push({ id: i, started_at: '2026-10-14T15:00:00.000Z', note: `other ${i}` });
-      server.state.entries.push({ id: 900, started_at: '2026-10-14T16:00:00.000Z', note: 'x [wbi:acme/widgets:2026-10-14]' });
+      server.state.entries.push({ id: 900, started_at: '2026-10-14T16:00:00.000Z', note: 'x [wbi:acme/widgets:2026-10-14]', billable: true, service_id: 9, duration: 900 });
       const result = await plan([line({ date: '2026-10-14' })]);
       assert.deepEqual(result.skip.map((s) => s.existing_id), [900]);
       const pages = server.state.log.filter((r) => r.method === 'GET').map((r) => new URL(r.url, 'http://x').searchParams.get('page'));
@@ -230,7 +231,7 @@ describe('freshbooks', () => {
       const { approval } = await plan(lines);
       server.state.failures.push({ method: 'POST', path: 'time_entries', status: 401 }, { method: 'POST', path: 'time_entries', status: 401 });
       await assert.rejects(push(lines, approval), (error) => {
-        assert.deepEqual(error.report.failed, { tag: lines[0].tag, created: 'no', error: error.report.failed.error });
+        assert.deepEqual(error.report.failed, { action: 'create', tag: lines[0].tag, created: 'no', error: error.report.failed.error });
         assert.match(error.report.failed.error, /HTTP 401/);
         assert.deepEqual(error.report.not_attempted, [lines[1].tag, lines[2].tag]);
         return true;
@@ -380,7 +381,7 @@ describe('freshbooks', () => {
         { ...line({ date: '2026-10-12', first: '2026-10-12 08:00:00' }), source: 'session' },
         { ...line({ date: '2026-10-16' }), source: 'session' },
       ];
-      server.state.entries.push({ id: 501, started_at: at('2026-10-16 10:00:00'), note: 'General development [wbi:acme/widgets:2026-10-16]' });
+      server.state.entries.push({ id: 501, started_at: at('2026-10-16 10:00:00'), note: 'General development [wbi:acme/widgets:2026-10-16]', billable: true, service_id: 9, duration: 900 });
       const table = await cli('plan', '--lines', linesFile(lines), '--format', 'table');
       const widgets = table.indexOf('## acme/widgets');
       const gadgets = table.indexOf('## acme/gadgets');
@@ -390,8 +391,9 @@ describe('freshbooks', () => {
       assert.ok(widgetRows.every((r) => r.includes('| hourly | session |')));
       assert.match(table.slice(gadgets), /\| 2026-10-13 \| .* \| 0\.25 \| hourly \| git \(fallback\) \| 6 \| 41 \| 9 \|/);
       assert.match(table.slice(widgets, gadgets), /\| \| \*\*Total\*\* \| 0\.75 \|/);
-      assert.match(table, /To create: 3 entries, 1\.00 h: 1\.00 h billable \(hourly\), 0\.00 h non-billable \(flat-rate\)\./);
-      assert.match(table, /Already in FreshBooks, skipped:\n\n- General development `\[wbi:acme\/widgets:2026-10-16\]` \(entry 501\)/);
+      assert.match(table, /To create: 3 entries, 1\.00 h, all billable: 1\.00 h hourly, 0\.00 h flat-rate\./);
+      assert.match(table, /Already in FreshBooks and unchanged, skipped: 1 entry\.\n\n- General development `\[wbi:acme\/widgets:2026-10-16\]` \(entry 501, hourly\)/);
+      assert.doesNotMatch(table, /To update|Existing entries to update/);
       assert.match(table, /Approval code: [0-9a-f]{16}/);
     });
   });
@@ -427,11 +429,12 @@ describe('freshbooks', () => {
       assert.equal(readFileSync(configPath, 'utf8'), before);
     });
 
-    it('lists the PRs of the lines as hourly until one is marked', async () => {
+    it('lists the PRs, issues and general days of the lines as hourly until one is marked', async () => {
       const out = await flatRate();
-      assert.deepEqual(out.pull_requests, [
-        { ref: 'acme/widgets#12', repo: 'acme/widgets', pr: 12, label: 'PR #12: Work', flat_rate: false, lines: 2, billable_hours: 1.25, description: 'hourly, 2 line(s), 1.25 h' },
-        { ref: 'acme/widgets#13', repo: 'acme/widgets', pr: 13, label: 'PR #13: Work', flat_rate: false, lines: 1, billable_hours: 0.25, description: 'hourly, 1 line(s), 0.25 h' },
+      assert.deepEqual(out.items, [
+        { ref: 'acme/widgets#12', kind: 'pr', repo: 'acme/widgets', label: 'PR #12: Work', flat_rate: false, lines: 2, billable_hours: 1.25, description: 'hourly, 2 line(s), 1.25 h' },
+        { ref: 'acme/widgets#13', kind: 'pr', repo: 'acme/widgets', label: 'PR #13: Work', flat_rate: false, lines: 1, billable_hours: 0.25, description: 'hourly, 1 line(s), 0.25 h' },
+        { ref: 'acme/widgets:2026-10-16', kind: 'general', repo: 'acme/widgets', label: 'General development on 2026-10-16', flat_rate: false, lines: 1, billable_hours: 0.25, description: 'hourly, 1 line(s), 0.25 h' },
       ]);
       assert.equal(savedMarks(), undefined);
     });
@@ -441,15 +444,16 @@ describe('freshbooks', () => {
       const marked = await flatRate('--mark', 'Acme/Widgets#13', '--mark', 'acme/widgets#12');
       assert.deepEqual(marked.marked, ['acme/widgets#13', 'acme/widgets#12']);
       assert.deepEqual(savedMarks(), { 'acme/widgets': [12, 13] });
-      assert.deepEqual(marked.pull_requests.map((p) => [p.ref, p.flat_rate, p.description]), [
+      assert.deepEqual(marked.items.map((p) => [p.ref, p.flat_rate, p.description]), [
         ['acme/widgets#12', true, 'flat-rate (saved mark), 2 line(s), 1.25 h'],
         ['acme/widgets#13', true, 'flat-rate (saved mark), 1 line(s), 0.25 h'],
+        ['acme/widgets:2026-10-16', false, 'hourly, 1 line(s), 0.25 h'],
       ]);
       const later = await plan(lines);
       assert.deepEqual(later.create.map((e) => [e.tag, e.rate, e.time_entry.billable, e.time_entry.service_id]), [
-        ['[wbi:acme/widgets#12:2026-10-14]', 'flat-rate', false, FLAT],
-        ['[wbi:acme/widgets#12:2026-10-15]', 'flat-rate', false, FLAT],
-        ['[wbi:acme/widgets#13:2026-10-15]', 'flat-rate', false, FLAT],
+        ['[wbi:acme/widgets#12:2026-10-14]', 'flat-rate', true, FLAT],
+        ['[wbi:acme/widgets#12:2026-10-15]', 'flat-rate', true, FLAT],
+        ['[wbi:acme/widgets#13:2026-10-15]', 'flat-rate', true, FLAT],
         ['[wbi:acme/widgets:2026-10-16]', 'hourly', true, 9],
       ]);
       const cleared = await flatRate('--clear', 'acme/widgets#13');
@@ -461,15 +465,18 @@ describe('freshbooks', () => {
       assert.ok((await plan(lines)).create.every((e) => e.rate === 'hourly' && e.time_entry.billable));
     });
 
-    it('refuses a mark for a PR that is not a PR line, a clear with no saved mark, or a bad ref, and saves nothing', async () => {
+    it('refuses a mark for a ref that is not a line, a clear with no saved mark, or a bad ref, and saves nothing', async () => {
       await flatRate('--mark', 'acme/widgets#12');
       const before = readFileSync(configPath, 'utf8');
-      await assert.rejects(flatRate('--mark', 'acme/widgets#99'), /acme\/widgets#99 is not a PR line in .*; nothing was saved/);
-      await assert.rejects(flatRate('--mark', 'acme/widgets#13', '--mark', 'acme/gadgets#13'), /acme\/gadgets#13 is not a PR line/);
+      await assert.rejects(flatRate('--mark', 'acme/widgets#99'), /acme\/widgets#99 is not a PR, issue or general line in .*; nothing was saved/);
+      await assert.rejects(flatRate('--mark', 'acme/widgets#13', '--mark', 'acme/gadgets#13'), /acme\/gadgets#13 is not a PR, issue or general line/);
+      await assert.rejects(flatRate('--mark', 'acme/widgets:2026-10-17'), /acme\/widgets:2026-10-17 is not a PR, issue or general line/);
       await assert.rejects(flatRate('--clear', 'acme/widgets#13'), /acme\/widgets#13 has no saved flat-rate mark; nothing was saved/);
+      await assert.rejects(flatRate('--clear', 'acme/widgets:2026-10-16'), /acme\/widgets:2026-10-16 has no saved flat-rate mark/);
       await assert.rejects(flatRate('--mark', 'acme/widgets#13', '--clear', 'acme/widgets#13'), /both marked and cleared/);
-      await assert.rejects(flatRate('--mark', 'acme/widgets'), /owner\/name#pr/);
-      await assert.rejects(flatRate('--mark', 'acme/widgets#0'), /owner\/name#pr/);
+      for (const ref of ['acme/widgets', 'acme/widgets#0', 'acme/widgets:2026-02-30', 'acme/widgets:20261016', 'acme/widgets#12:2026-10-14']) {
+        await assert.rejects(flatRate('--mark', ref), /owner\/name#number or owner\/name:YYYY-MM-DD/);
+      }
       assert.equal(readFileSync(configPath, 'utf8'), before);
     });
 
@@ -481,13 +488,13 @@ describe('freshbooks', () => {
       assert.deepEqual(result.create.map((e) => [e.rate, e.pr]), [['flat-rate', 12], ['hourly', null]]);
     });
 
-    it('posts a flat-rate line as non-billable under the flat-rate service, and an hourly line as before, with the same tag form', async () => {
+    it('posts a flat-rate line as billable under the flat-rate service, and an hourly line as before, with the same tag form', async () => {
       withFlatService();
       await flatRate('--mark', 'acme/widgets#12');
       const reviewed = [lines[0], lines[3]];
       await push(reviewed, (await plan(reviewed)).approval);
       assert.deepEqual(server.posts().map((p) => p.body), [
-        { time_entry: { is_logged: true, duration: 2700, started_at: '2026-10-14T17:00:00.000Z', note: 'PR #12: Work [wbi:acme/widgets#12:2026-10-14]', billable: false, client_id: 5, project_id: 40, service_id: FLAT } },
+        { time_entry: { is_logged: true, duration: 2700, started_at: '2026-10-14T17:00:00.000Z', note: 'PR #12: Work [wbi:acme/widgets#12:2026-10-14]', billable: true, client_id: 5, project_id: 40, service_id: FLAT } },
         { time_entry: { is_logged: true, duration: 900, started_at: '2026-10-16T17:00:00.000Z', note: 'General development [wbi:acme/widgets:2026-10-16]', billable: true, client_id: 5, project_id: 40, service_id: 9 } },
       ]);
     });
@@ -504,7 +511,7 @@ describe('freshbooks', () => {
       assert.equal(server.posts().length, 0);
     });
 
-    it('shows the rate of each line and splits billable from non-billable hours in the table', async () => {
+    it('shows the rate of each line and splits hourly from flat-rate hours in the table', async () => {
       withFlatService();
       await flatRate('--mark', 'acme/widgets#12');
       const table = await cli('plan', '--lines', linesFile(lines), '--format', 'table');
@@ -515,7 +522,7 @@ describe('freshbooks', () => {
         ['hourly', '9 |'],
         ['hourly', '9 |'],
       ]);
-      assert.match(table, /To create: 4 entries, 1\.75 h: 0\.50 h billable \(hourly\), 1\.25 h non-billable \(flat-rate\)\./);
+      assert.match(table, /To create: 4 entries, 1\.75 h, all billable: 0\.50 h hourly, 1\.25 h flat-rate\./);
       assert.match(table, /Approval code: [0-9a-f]{16}/);
     });
 
@@ -528,20 +535,26 @@ describe('freshbooks', () => {
       const table = await cli('plan', '--lines', linesFile(lines), '--format', 'table');
       assert.match(table, /\| 2026-10-15 \| PR #13: Work .* \| flat-rate \(saved mark\) \| session \| 5 \| 40 \| none \|/);
       assert.match(table, /Cannot create: acme\/widgets has lines marked flat-rate but no flat-rate service mapped\. Map one with map\.sh --flat-rate-service, or clear the marks with flat-rate\.sh\./);
-      assert.match(table, /No approval code until every flat-rate line has a service\./);
+      assert.match(table, /No approval code until every "Cannot" line above is fixed\./);
       assert.doesNotMatch(table, /Approval code:/);
       for (const code of [before, 'null', 'deadbeefdeadbeef']) {
-        await assert.rejects(push(lines, code), /no flat-rate service mapped.*; nothing was created/);
+        await assert.rejects(push(lines, code), /no flat-rate service mapped.*; nothing was created or updated/);
       }
       assert.equal(server.posts().length, 0);
     });
 
-    it('does not block a flat-rate line that FreshBooks already holds', async () => {
+    it('blocks a flat-rate line that FreshBooks holds as hourly while its repo has no flat-rate service', async () => {
       await flatRate('--mark', 'acme/widgets#13');
-      server.state.entries.push({ id: 502, started_at: at('2026-10-15 11:00:00'), note: 'PR #13: Work [wbi:acme/widgets#13:2026-10-15]' });
+      server.state.entries.push({ id: 502, started_at: at('2026-10-15 11:00:00'), note: 'PR #13: Work [wbi:acme/widgets#13:2026-10-15]', billable: true, service_id: 9, duration: 900 });
       const result = await plan(lines);
-      assert.deepEqual(result.blocked, []);
-      assert.match(result.approval, /^[0-9a-f]{16}$/);
+      assert.equal(result.approval, null);
+      assert.deepEqual(result.blocked.map((b) => [b.action, b.repo]), [['update', 'acme/widgets']]);
+      assert.deepEqual([result.update, result.skip], [[], []]);
+      const table = await cli('plan', '--lines', linesFile(lines), '--format', 'table');
+      assert.match(table, /Cannot update: acme\/widgets has lines marked flat-rate but no flat-rate service mapped\./);
+      assert.doesNotMatch(table, /Approval code:/);
+      await assert.rejects(push(lines, 'deadbeefdeadbeef'), /no flat-rate service mapped.*; nothing was created or updated/);
+      assert.deepEqual([server.posts().length, server.puts().length], [0, 0]);
     });
 
     it('refuses a PR line whose pr does not match its tag', async () => {
@@ -554,6 +567,363 @@ describe('freshbooks', () => {
       const result = await plan([line({ date: '2026-10-14', pr: 12, repo: 'Acme/Widgets' })]);
       assert.deepEqual(result.create.map((e) => [e.tag, e.pr]), [['[wbi:acme/widgets#12:2026-10-14]', 12]]);
     });
+  });
+
+  describe('flat-rate marks for issue and general lines', () => {
+    const FLAT = 11;
+    const issueLine = (date, issue, hours = 0.25) => ({ ...line({ date, hours }), kind: 'issue', issue, label: `Issue #${issue}: LXXVAR`, tag: `[wbi:acme/widgets#${issue}:${date}]` });
+    const lines = [line({ date: '2026-10-14', pr: 12 }), issueLine('2026-10-14', 36, 0.5), issueLine('2026-10-15', 36), line({ date: '2026-10-15' }), line({ date: '2026-10-16' })];
+    const flatRate = async (...args) => JSON.parse(await cli('flat-rate', '--lines', linesFile(lines), ...args));
+    const saved = () => JSON.parse(readFileSync(configPath, 'utf8')).freshbooks;
+    const rates = async () => (await plan(lines)).create.map((e) => [e.tag, e.rate, e.time_entry.billable, e.time_entry.service_id]);
+
+    beforeEach(() => {
+      server.state.services.push({ id: FLAT, name: 'Milestone', vis_state: 0 });
+      updateConfig(configPath, (raw) => {
+        raw.freshbooks.repos['acme/widgets'] = { ...MAPPING, flat_rate_service_id: FLAT };
+        raw.freshbooks.flat_rate_prs = { 'acme/widgets': [12] };
+      });
+    });
+
+    it('lists each issue once and each general line by day, beside the PRs', async () => {
+      const out = await flatRate();
+      assert.deepEqual(out.items.map((i) => [i.ref, i.kind, i.label, i.flat_rate, i.description]), [
+        ['acme/widgets#12', 'pr', 'PR #12: Work', true, 'flat-rate (saved mark), 1 line(s), 0.25 h'],
+        ['acme/widgets#36', 'issue', 'Issue #36: LXXVAR', false, 'hourly, 2 line(s), 0.75 h'],
+        ['acme/widgets:2026-10-15', 'general', 'General development on 2026-10-15', false, 'hourly, 1 line(s), 0.25 h'],
+        ['acme/widgets:2026-10-16', 'general', 'General development on 2026-10-16', false, 'hourly, 1 line(s), 0.25 h'],
+      ]);
+    });
+
+    it('remembers an issue mark by issue, keeps the PR marks, and clears it', async () => {
+      const marked = await flatRate('--mark', 'Acme/Widgets#36');
+      assert.deepEqual(marked.marked, ['acme/widgets#36']);
+      assert.deepEqual(saved().flat_rate_issues, { 'acme/widgets': [36] });
+      assert.deepEqual(saved().flat_rate_prs, { 'acme/widgets': [12] });
+      assert.deepEqual(saved().flat_rate_days, {});
+      assert.deepEqual(await rates(), [
+        ['[wbi:acme/widgets#12:2026-10-14]', 'flat-rate', true, FLAT],
+        ['[wbi:acme/widgets#36:2026-10-14]', 'flat-rate', true, FLAT],
+        ['[wbi:acme/widgets#36:2026-10-15]', 'flat-rate', true, FLAT],
+        ['[wbi:acme/widgets:2026-10-15]', 'hourly', true, 9],
+        ['[wbi:acme/widgets:2026-10-16]', 'hourly', true, 9],
+      ]);
+      await flatRate('--clear', 'acme/widgets#36');
+      assert.deepEqual(saved().flat_rate_issues, {});
+      assert.deepEqual(saved().flat_rate_prs, { 'acme/widgets': [12] });
+      assert.deepEqual((await rates()).map((r) => r[1]), ['flat-rate', 'hourly', 'hourly', 'hourly', 'hourly']);
+    });
+
+    it('remembers a general mark per repo and day, leaving other days and other lines of that day hourly', async () => {
+      await flatRate('--mark', 'acme/widgets:2026-10-15');
+      assert.deepEqual(saved().flat_rate_days, { 'acme/widgets': ['2026-10-15'] });
+      assert.deepEqual((await rates()).map((r) => r[1]), ['flat-rate', 'hourly', 'hourly', 'flat-rate', 'hourly']);
+      const out = await flatRate('--mark', 'acme/widgets:2026-10-16');
+      assert.deepEqual(saved().flat_rate_days, { 'acme/widgets': ['2026-10-15', '2026-10-16'] });
+      assert.deepEqual(out.items.filter((i) => i.kind === 'general').map((i) => i.flat_rate), [true, true]);
+      const cleared = await flatRate('--clear', 'acme/widgets:2026-10-15');
+      assert.deepEqual(cleared.cleared, ['acme/widgets:2026-10-15']);
+      assert.deepEqual(saved().flat_rate_days, { 'acme/widgets': ['2026-10-16'] });
+      assert.deepEqual((await rates()).map((r) => r[1]), ['flat-rate', 'hourly', 'hourly', 'hourly', 'flat-rate']);
+    });
+
+    it('does not let a PR mark and an issue mark of the same number cross', async () => {
+      await flatRate('--clear', 'acme/widgets#12');
+      updateConfig(configPath, (raw) => {
+        raw.freshbooks.flat_rate_prs = { 'acme/widgets': [36] };
+        raw.freshbooks.flat_rate_issues = { 'acme/widgets': [12] };
+      });
+      assert.ok((await rates()).every((r) => r[1] === 'hourly'));
+      await assert.rejects(flatRate('--clear', 'acme/widgets:2026-10-14'), /has no saved flat-rate mark/);
+    });
+
+    it('refuses an issue line whose issue does not match its tag, a general line with a numbered tag, and an unknown kind', async () => {
+      await assert.rejects(plan([{ ...issueLine('2026-10-14', 36), issue: 37 }]), /issue line whose issue does not match its tag/);
+      await assert.rejects(plan([{ ...issueLine('2026-10-14', 36), issue: null }]), /issue line whose issue does not match its tag/);
+      await assert.rejects(plan([{ ...line({ date: '2026-10-14' }), tag: '[wbi:acme/widgets#5:2026-10-14]' }]), /general line whose tag names a PR or issue/);
+      await assert.rejects(plan([{ ...line({ date: '2026-10-14' }), kind: 'misc' }]), /unknown kind "misc"/);
+    });
+  });
+
+  describe('reconcile', () => {
+    const FLAT = 11;
+    const lines = [line({ date: '2026-10-14', pr: 12, hours: 0.75 }), line({ date: '2026-10-15' }), line({ date: '2026-10-16' }), line({ date: '2026-10-17' })];
+    const entry = (id, l, fields) => ({ id, duration: Math.round(l.billable_hours * 3600), started_at: l.first_work, note: `${l.label} ${l.tag}`, client_id: 5, project_id: 40, ...fields });
+    const seed = () => {
+      server.state.entries.push(
+        entry(601, lines[0], { billable: false, service_id: FLAT }),
+        entry(602, lines[1], { billable: true, service_id: 9 }),
+        entry(603, lines[2], { billable: true, service_id: 9 }),
+        { id: 604, duration: 3600, started_at: lines[1].first_work, note: 'Mike by hand on the same day', billable: false, service_id: FLAT, client_id: 5, project_id: 40 },
+        { id: 605, duration: 900, started_at: lines[0].first_work, note: 'Near miss [wbi:acme/widgets#123:2026-10-14]', billable: false, service_id: FLAT, client_id: 5, project_id: 40 },
+      );
+    };
+    const snapshot = (id) => structuredClone(server.state.entries.find((e) => e.id === id));
+
+    beforeEach(() => {
+      server.state.services.push({ id: FLAT, name: 'Milestone', vis_state: 0 });
+      updateConfig(configPath, (raw) => {
+        raw.freshbooks.repos['acme/widgets'] = { ...MAPPING, flat_rate_service_id: FLAT };
+        raw.freshbooks.flat_rate_prs = { 'acme/widgets': [12] };
+        raw.freshbooks.flat_rate_days = { 'acme/widgets': ['2026-10-15'] };
+      });
+      seed();
+    });
+
+    it('lists each tagged entry whose billable flag or service differs as to update, with old and new values', async () => {
+      const result = await plan(lines);
+      assert.deepEqual(result.create.map((e) => e.tag), [lines[3].tag]);
+      assert.deepEqual(result.update.map(({ tag, id, rate, from, to, hours }) => ({ tag, id, rate, from, to, hours })), [
+        { tag: lines[0].tag, id: 601, rate: 'flat-rate', from: { billable: false }, to: { billable: true }, hours: 0.75 },
+        { tag: lines[1].tag, id: 602, rate: 'flat-rate', from: { service_id: 9 }, to: { service_id: FLAT }, hours: 0.25 },
+      ]);
+      assert.deepEqual(result.skip, [{ tag: lines[2].tag, label: 'General development', rate: 'hourly', existing_id: 603 }]);
+      assert.match(result.approval, /^[0-9a-f]{16}$/);
+    });
+
+    it('shows updates apart from new and unchanged entries in the table, and counts them', async () => {
+      const table = await cli('plan', '--lines', linesFile(lines), '--format', 'table');
+      const section = table.slice(table.indexOf('## Existing entries to update'), table.indexOf('To create:'));
+      assert.match(section, /\| Date \| Note \| Hours \| Rate \| Entry \| Billable \| Service \|/);
+      assert.match(section, /\| 2026-10-14 \| PR #12: Work \[wbi:acme\/widgets#12:2026-10-14\] \| 0\.75 \| flat-rate \(saved mark\) \| 601 \| false → true \| unchanged \|/);
+      assert.match(section, /\| 2026-10-15 \| General development \[wbi:acme\/widgets:2026-10-15\] \| 0\.25 \| flat-rate \(saved mark\) \| 602 \| unchanged \| 9 → 11 \|/);
+      assert.doesNotMatch(section, /604|605|603|2026-10-17/);
+      assert.match(table, /## acme\/widgets\n\n.*\n.*\n\| 2026-10-17 \|/);
+      assert.match(table, /To create: 1 entry, 0\.25 h, all billable: 0\.25 h hourly, 0\.00 h flat-rate\./);
+      assert.match(table, /To update: 2 existing entries, 1 billable change and 1 service change\. Duration, date and note stay as they are\./);
+      assert.match(table, /Already in FreshBooks and unchanged, skipped: 1 entry\.\n\n- General development `\[wbi:acme\/widgets:2026-10-16\]` \(entry 603, hourly\)/);
+      assert.match(table, /Approval code: [0-9a-f]{16}/);
+    });
+
+    it('offers a code for updates alone, and says nothing is left once they are applied', async () => {
+      const only = lines.slice(0, 3);
+      const table = await cli('plan', '--lines', linesFile(only), '--format', 'table');
+      assert.doesNotMatch(table, /To create:/);
+      assert.match(table, /Approval code: [0-9a-f]{16}/);
+      await push(only, (await plan(only)).approval);
+      const after = await cli('plan', '--lines', linesFile(only), '--format', 'table');
+      assert.match(after, /Nothing to create or update\./);
+      assert.match(after, /skipped: 3 entries\./);
+      assert.doesNotMatch(after, /Approval code/);
+    });
+
+    it('PUTs only the changed keys of each update under a matching code, after the creates', async () => {
+      const result = await plan(lines);
+      const report = await push(lines, result.approval);
+      assert.deepEqual(server.puts().map((r) => [r.path, r.body]), [
+        ['/timetracking/business/77/time_entries/601', { time_entry: { billable: true } }],
+        ['/timetracking/business/77/time_entries/602', { time_entry: { service_id: FLAT } }],
+      ]);
+      const order = server.state.log.filter((r) => r.path.includes('time_entries') && r.method !== 'GET').map((r) => r.method);
+      assert.deepEqual(order, ['POST', 'PUT', 'PUT']);
+      assert.deepEqual(report.created.map((c) => c.tag), [lines[3].tag]);
+      assert.deepEqual(report.updated, [
+        { tag: lines[0].tag, id: 601, from: { billable: false }, to: { billable: true } },
+        { tag: lines[1].tag, id: 602, from: { service_id: 9 }, to: { service_id: FLAT } },
+      ]);
+      assert.deepEqual(report.skipped.map((s) => s.existing_id), [603]);
+      assert.equal(report.failed, null);
+      assert.deepEqual(report.not_attempted, []);
+      const again = await plan(lines);
+      assert.deepEqual([again.create.length, again.update.length], [0, 0]);
+    });
+
+    it('makes no PUT without a code, with a wrong code, or after FreshBooks, a mark or the lines change', async () => {
+      const { approval } = await plan(lines);
+      await assert.rejects(cli('push', '--lines', linesFile(lines)), /needs --approve/);
+      await assert.rejects(push(lines, 'deadbeefdeadbeef'), /does not match the current plan; nothing was created or updated/);
+      server.state.entries.find((e) => e.id === 602).service_id = 12;
+      await assert.rejects(push(lines, approval), /does not match/);
+      server.state.entries.find((e) => e.id === 602).service_id = 9;
+      server.state.entries.find((e) => e.id === 601).billable = true;
+      await assert.rejects(push(lines, approval), /does not match/);
+      server.state.entries.find((e) => e.id === 601).billable = false;
+      await cli('flat-rate', '--lines', linesFile(lines), '--clear', 'acme/widgets:2026-10-15');
+      await assert.rejects(push(lines, approval), /does not match/);
+      assert.equal(server.puts().length, 0);
+      assert.equal(server.posts().length, 0);
+    });
+
+    it('never updates an entry without a plugin tag, and never changes its duration, date or note', async () => {
+      const before = [601, 602, 604, 605].map(snapshot);
+      await push(lines, (await plan(lines)).approval);
+      assert.deepEqual(server.puts().map((r) => r.path.split('/').at(-1)), ['601', '602']);
+      for (const old of before) {
+        const now = snapshot(old.id);
+        assert.deepEqual([now.duration, now.started_at, now.note], [old.duration, old.started_at, old.note]);
+      }
+      assert.deepEqual(snapshot(604), before[2]);
+      assert.deepEqual(snapshot(605), before[3]);
+      assert.ok(server.puts().every((r) => Object.keys(r.body.time_entry).every((k) => ['billable', 'service_id'].includes(k))));
+    });
+
+    it('refuses at push an update that targets an untagged entry or changes another field, and changes nothing', async () => {
+      const settings = freshbooksSettings(normalizeConfig(JSON.parse(readFileSync(configPath, 'utf8'))));
+      const client = createClient({ settings, keychain, base: server.url, sleep: async () => {} });
+      const listed = snapshot(601);
+      const good = { tag: lines[0].tag, id: 601, repo: 'acme/widgets', note: listed.note, duration: listed.duration, started_at: listed.started_at, from: { billable: false }, to: { billable: true } };
+      const attempt = (u) => {
+        const crafted = { business_id: 77, blocked: [], create: [], update: [u], skip: [] };
+        return pushPlan({ client, plan: { ...crafted, approval: approvalCode(77, [], [u]) }, approval: approvalCode(77, [], [u]) });
+      };
+      for (const bad of [
+        { ...good, id: 604, note: 'Mike by hand on the same day' },
+        { ...good, tag: 'mike' },
+        { ...good, to: { billable: true, duration: 60 } },
+        { ...good, to: { note: 'x' } },
+        { ...good, to: {} },
+        { ...good, id: '601' },
+      ]) {
+        await assert.rejects(attempt(bad), /does not target a tagged entry with only billable or service_id; nothing was created or updated/);
+      }
+      assert.equal(server.puts().length, 0);
+      const report = await attempt(good);
+      assert.deepEqual(report.updated.map((u) => u.id), [601]);
+    });
+
+    it('reports a failed PUT, whether the entry may have changed, and what was not attempted', async () => {
+      const { approval } = await plan(lines);
+      server.state.failures.push({ method: 'PUT', path: '/601', status: 500 });
+      await assert.rejects(push(lines, approval), (error) => {
+        assert.match(error.message, /stopped at \[wbi:acme\/widgets#12:2026-10-14\]: .*HTTP 500/);
+        assert.deepEqual(error.report.created.map((c) => c.tag), [lines[3].tag]);
+        assert.deepEqual(error.report.updated, []);
+        assert.deepEqual({ ...error.report.failed, error: null }, { action: 'update', tag: lines[0].tag, id: 601, changed: 'unknown', error: null });
+        assert.deepEqual(error.report.not_attempted, [lines[1].tag]);
+        assert.deepEqual(error.report.skipped.map((s) => s.existing_id), [603]);
+        return true;
+      });
+      const second = await plan(lines);
+      server.state.failures.push({ method: 'PUT', path: '/602', status: 422 });
+      await assert.rejects(push(lines, second.approval), (error) => {
+        assert.deepEqual(error.report.updated.map((u) => u.id), [601]);
+        assert.equal(error.report.failed.changed, 'no');
+        assert.deepEqual(error.report.not_attempted, []);
+        return true;
+      });
+    });
+
+    it('reports a PUT whose response does not show the new values as possibly changed', async () => {
+      const { approval } = await plan(lines);
+      server.state.failures.push({ method: 'PUT', path: '/601', status: 200, body: { time_entry: { id: 601, billable: false } } });
+      await assert.rejects(push(lines, approval), (error) => {
+        assert.equal(error.report.failed.changed, 'unknown');
+        assert.match(error.report.failed.error, /does not show entry 601 with the new values/);
+        return true;
+      });
+      const next = await plan(lines);
+      server.state.failures.push({ method: 'PUT', path: '/601', status: 200, body: { time_entry: { id: 999, billable: true } } });
+      await assert.rejects(push(lines, next.approval), (error) => error.report.failed.changed === 'unknown');
+    });
+
+    it('lists the updates as not attempted when a create fails first', async () => {
+      const { approval } = await plan(lines);
+      server.state.failures.push({ method: 'POST', path: 'time_entries', status: 422 });
+      await assert.rejects(push(lines, approval), (error) => {
+        assert.equal(error.report.failed.action, 'create');
+        assert.deepEqual(error.report.not_attempted, [lines[0].tag, lines[1].tag]);
+        return true;
+      });
+      assert.equal(server.puts().length, 0);
+    });
+
+    it('reads a service id sent as a string as the same service', async () => {
+      server.state.entries.find((e) => e.id === 603).service_id = '9';
+      const result = await plan(lines);
+      assert.deepEqual(result.skip.map((s) => s.existing_id), [603]);
+    });
+
+    it('blocks an update whose entry has no valid id, or whose entry carries two tags', async () => {
+      server.state.entries.find((e) => e.id === 601).id = null;
+      const noId = await plan(lines);
+      assert.equal(noId.approval, null);
+      assert.match(noId.blocked[0].reason, /carries \[wbi:acme\/widgets#12:2026-10-14\] has no valid id null/);
+      const table = await cli('plan', '--lines', linesFile(lines), '--format', 'table');
+      assert.match(table, /Cannot update: an entry that carries .* has no valid id null, so it cannot be updated\./);
+      assert.match(table, /No approval code until every "Cannot" line above is fixed\./);
+      server.state.entries.find((e) => e.id === null).id = 601;
+      server.state.entries.find((e) => e.id === 602).note += ` ${lines[0].tag}`;
+      server.state.entries.find((e) => e.id === 601).note = 'moved';
+      const twoTags = await plan(lines);
+      assert.equal(twoTags.approval, null);
+      assert.deepEqual(twoTags.blocked.map((b) => b.reason), [`entry 602 carries the tags of more than one line (${lines[0].tag}, ${lines[1].tag}), so it is ambiguous`]);
+      await assert.rejects(push(lines, 'deadbeefdeadbeef'), /ambiguous; nothing was created or updated/);
+      assert.equal(server.puts().length, 0);
+    });
+
+    it('blocks an entry that carries one tag that matches and one that differs', async () => {
+      server.state.entries.find((e) => e.id === 602).note = 'moved';
+      server.state.entries.find((e) => e.id === 603).note += ` ${lines[1].tag}`;
+      const result = await plan(lines);
+      assert.deepEqual(result.update.map((u) => [u.id, u.tag]), [[601, lines[0].tag], [603, lines[1].tag]]);
+      assert.deepEqual(result.skip.map((s) => [s.existing_id, s.tag]), [[603, lines[2].tag]]);
+      assert.equal(result.approval, null);
+      assert.deepEqual(result.blocked.map((b) => b.reason), [`entry 603 carries the tags of more than one line (${lines[1].tag}, ${lines[2].tag}), so it is ambiguous`]);
+      await assert.rejects(push(lines, 'deadbeefdeadbeef'), /ambiguous; nothing was created or updated/);
+      assert.deepEqual([server.posts().length, server.puts().length], [0, 0]);
+    });
+
+    it('blocks existing flat-rate lines, billable or not, when the marked repo has no flat-rate service', async () => {
+      updateConfig(configPath, (raw) => {
+        raw.freshbooks.repos['acme/widgets'] = MAPPING;
+      });
+      const result = await plan(lines.slice(0, 3));
+      assert.equal(result.approval, null);
+      assert.deepEqual(result.blocked.map((b) => [b.action, b.repo]), [['update', 'acme/widgets']]);
+      assert.deepEqual(result.update, []);
+      assert.deepEqual(result.skip.map((s) => s.existing_id), [603]);
+      const table = await cli('plan', '--lines', linesFile(lines.slice(0, 3)), '--format', 'table');
+      assert.match(table, /Cannot update: acme\/widgets has lines marked flat-rate but no flat-rate service mapped\./);
+      assert.doesNotMatch(table, /601|602/);
+      assert.equal(server.puts().length, 0);
+    });
+
+    it('blocks instead of guessing when the list leaves out billable or service_id', async () => {
+      updateConfig(configPath, (raw) => {
+        raw.freshbooks.flat_rate_prs = {};
+        raw.freshbooks.flat_rate_days = {};
+      });
+      for (const e of server.state.entries) {
+        delete e.billable;
+        delete e.service_id;
+      }
+      const result = await plan(lines.slice(1, 3));
+      assert.deepEqual([result.update, result.skip], [[], []]);
+      assert.equal(result.approval, null);
+      assert.deepEqual(result.blocked.map((b) => b.reason), ['the FreshBooks list did not return billable, service_id for entry 602, entry 603, so the plan cannot compare them with the lines']);
+      const table = await cli('plan', '--lines', linesFile(lines.slice(1, 3)), '--format', 'table');
+      assert.doesNotMatch(table, /none →|Existing entries to update/);
+      assert.match(table, /Cannot update: the FreshBooks list did not return billable, service_id for entry 602, entry 603/);
+      await assert.rejects(push(lines.slice(1, 3), 'deadbeefdeadbeef'), /did not return.*; nothing was created or updated/);
+      assert.equal(server.puts().length, 0);
+    });
+
+    it('blocks when the list leaves out duration or started_at, which the PUT check needs', async () => {
+      delete server.state.entries.find((e) => e.id === 601).duration;
+      const result = await plan(lines);
+      assert.equal(result.approval, null);
+      assert.match(result.blocked[0].reason, /did not return duration for entry 601/);
+    });
+
+    for (const [field, mangle] of [
+      ['note', (e) => ({ ...e, note: undefined })],
+      ['duration', (e) => ({ ...e, duration: 0 })],
+      ['started_at', (e) => ({ ...e, started_at: '2026-10-14T00:00:00.000Z' })],
+    ]) {
+      it(`stops at an update whose PUT response shows a changed ${field}, as possibly changed`, async () => {
+        const { approval } = await plan(lines);
+        const listed = snapshot(601);
+        server.state.failures.push({ method: 'PUT', path: '/601', status: 200, body: { time_entry: mangle({ ...listed, billable: true }) } });
+        await assert.rejects(push(lines, approval), (error) => {
+          assert.deepEqual({ ...error.report.failed, error: null }, { action: 'update', tag: lines[0].tag, id: 601, changed: 'unknown', error: null });
+          assert.match(error.report.failed.error, new RegExp(`shows entry 601 with a changed ${field}; check FreshBooks before a rerun`));
+          assert.deepEqual(error.report.updated, []);
+          assert.deepEqual(error.report.not_attempted, [lines[1].tag]);
+          return true;
+        });
+        assert.deepEqual(server.puts().map((r) => r.path.split('/').at(-1)), ['601']);
+      });
+    }
   });
 
   describe('range', () => {
@@ -756,6 +1126,28 @@ describe('freshbooks settings', () => {
     assert.throws(() => settings({ flat_rate_prs: { 'Acme/Widgets': [12] } }), /flat_rate_prs key "Acme\/Widgets" must be a lower-case owner\/name/);
     for (const prs of [[12, 12], [0], ['12'], 12]) {
       assert.throws(() => settings({ flat_rate_prs: { 'acme/widgets': prs } }), /must be a list of distinct PR numbers/);
+    }
+  });
+
+  it('loads a config that holds only mappings and PR marks, as written by the earlier release', () => {
+    const map = { client_id: 1172627, project_id: 12126825, service_id: 24739129, flat_rate_service_id: 26013013 };
+    const repos = { 'crossbibleinc/data-importer': map, 'crossbibleinc/bible-models': map, 'crossbibleinc/third': map };
+    const prs = { 'crossbibleinc/data-importer': [44, 45], 'crossbibleinc/bible-models': [11] };
+    const loaded = settings({ repos, flat_rate_prs: prs });
+    assert.deepEqual([loaded.repos, loaded.flat_rate_prs, loaded.flat_rate_issues, loaded.flat_rate_days], [repos, prs, {}, {}]);
+  });
+
+  it('loads saved issue and day marks, defaults them to empty, and refuses bad ones', () => {
+    assert.deepEqual([settings({}).flat_rate_issues, settings({}).flat_rate_days], [{}, {}]);
+    const loaded = settings({ flat_rate_prs: { 'acme/widgets': [45] }, flat_rate_issues: { 'acme/widgets': [36] }, flat_rate_days: { 'acme/widgets': ['2026-10-19'] } });
+    assert.deepEqual([loaded.flat_rate_prs, loaded.flat_rate_issues, loaded.flat_rate_days], [{ 'acme/widgets': [45] }, { 'acme/widgets': [36] }, { 'acme/widgets': ['2026-10-19'] }]);
+    assert.throws(() => settings({ flat_rate_issues: [] }), /flat_rate_issues must be an object/);
+    assert.throws(() => settings({ flat_rate_days: { 'Acme/Widgets': ['2026-10-19'] } }), /flat_rate_days key "Acme\/Widgets" must be a lower-case owner\/name/);
+    for (const issues of [[36, 36], [0], ['36']]) {
+      assert.throws(() => settings({ flat_rate_issues: { 'acme/widgets': issues } }), /flat_rate_issues\.acme\/widgets must be a list of distinct issue numbers/);
+    }
+    for (const days of [['2026-10-19', '2026-10-19'], ['2026-02-30'], [20261019], '2026-10-19']) {
+      assert.throws(() => settings({ flat_rate_days: { 'acme/widgets': days } }), /flat_rate_days\.acme\/widgets must be a list of distinct YYYY-MM-DD dates/);
     }
   });
 

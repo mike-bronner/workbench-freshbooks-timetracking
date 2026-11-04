@@ -129,7 +129,7 @@ describe('freshbooks scripts', () => {
     const lines = join(box.root, 'lines.json');
     writeFileSync(lines, JSON.stringify({
       range: { from: '2026-10-14', to: '2026-10-14', timezone: TZ },
-      repos: [{ repo: 'acme/widgets', lines: [{ repo: 'acme/widgets', date: '2026-10-14', label: 'General development', billable_hours: 0.5, first_work: at('2026-10-14 09:00:00'), tag: '[wbi:acme/widgets:2026-10-14]' }] }],
+      repos: [{ repo: 'acme/widgets', lines: [{ repo: 'acme/widgets', date: '2026-10-14', kind: 'general', label: 'General development', billable_hours: 0.5, first_work: at('2026-10-14 09:00:00'), tag: '[wbi:acme/widgets:2026-10-14]' }] }],
     }));
 
     const plan = await launch('plan.sh', ['--lines', lines, '--format', 'table'], env).done;
