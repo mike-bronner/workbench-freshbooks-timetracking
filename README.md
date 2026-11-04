@@ -138,18 +138,27 @@ bin/push.sh --lines lines.json --approve <code>
     flat-rate service.
   - The FreshBooks list leaves out `billable`, `service_id`, `duration` or
     `started_at` for a tagged entry, so the plan cannot compare it.
+  - The FreshBooks list leaves out `is_logged`, `client_id` or `project_id`
+    for an entry to update, so the plan cannot send the full entry.
+  - The listed `is_logged` of an entry to update is not true or false, or its
+    `started_at` or `duration` is not a valid value.
   - An update has no valid entry id.
   - One entry carries the tags of more than one line.
 - The plan table groups the new entries by repo in order of first work, shows
   the rate of each line, marks git-sourced lines, and splits hourly from
-  flat-rate hours. A separate section lists the updates, and a list names the
-  unchanged entries.
+  flat-rate hours. A separate section lists the updates with the client and
+  project of each entry, and a list names the unchanged entries.
 - `push.sh` builds the plan again, and creates and updates entries only when
   the code matches, so a changed line set, a changed mark or a changed
   FreshBooks entry needs a new review. It changes nothing while the plan has
   no code. It creates the new entries first, then sends each update as a PUT
-  with only the changed keys. It stops when the PUT response does not show the
-  new values, or shows a duration, date or note other than the listed one.
+  of the full entry as the list returned it (`is_logged`, `started_at`,
+  `duration`, `note`, `client_id`, `project_id`, `service_id` and
+  `billable`), with only the billable flag or the service changed. FreshBooks
+  refuses a PUT that leaves out `started_at` or `is_logged`, and a field left
+  out could be reset. The approval code covers every value of that body. It
+  stops when the PUT response does not show the new values, or shows any
+  other field of the body with a value other than the one it sent.
   It stops at the first error, and prints which entries were created, which
   were updated, which were skipped, which failed and which were not attempted.
   A failed update says whether the entry may have changed. It also stops when

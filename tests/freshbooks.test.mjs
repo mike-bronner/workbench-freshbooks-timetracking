@@ -9,7 +9,7 @@ import { after, afterEach, beforeEach, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { freshbooksSettings, normalizeConfig, updateConfig } from '../lib/config.mjs';
-import { apiBase, createClient, pickBusiness } from '../lib/freshbooks/api.mjs';
+import { apiBase, createClient, pickBusiness, updateTimeEntry } from '../lib/freshbooks/api.mjs';
 import { run } from '../lib/freshbooks/cli.mjs';
 import { ACCESS_TOKEN, CLIENT_SECRET as SECRET_ACCOUNT, REFRESH_TOKEN, SERVICE, systemKeychain } from '../lib/freshbooks/keychain.mjs';
 import { selfSignedCert, waitForCode } from '../lib/freshbooks/login.mjs';
@@ -648,14 +648,14 @@ describe('freshbooks', () => {
   describe('reconcile', () => {
     const FLAT = 11;
     const lines = [line({ date: '2026-10-14', pr: 12, hours: 0.75 }), line({ date: '2026-10-15' }), line({ date: '2026-10-16' }), line({ date: '2026-10-17' })];
-    const entry = (id, l, fields) => ({ id, duration: Math.round(l.billable_hours * 3600), started_at: l.first_work, note: `${l.label} ${l.tag}`, client_id: 5, project_id: 40, ...fields });
+    const entry = (id, l, fields) => ({ id, is_logged: true, duration: Math.round(l.billable_hours * 3600), started_at: l.first_work, note: `${l.label} ${l.tag}`, client_id: 5, project_id: 40, ...fields });
     const seed = () => {
       server.state.entries.push(
         entry(601, lines[0], { billable: false, service_id: FLAT }),
         entry(602, lines[1], { billable: true, service_id: 9 }),
         entry(603, lines[2], { billable: true, service_id: 9 }),
-        { id: 604, duration: 3600, started_at: lines[1].first_work, note: 'Mike by hand on the same day', billable: false, service_id: FLAT, client_id: 5, project_id: 40 },
-        { id: 605, duration: 900, started_at: lines[0].first_work, note: 'Near miss [wbi:acme/widgets#123:2026-10-14]', billable: false, service_id: FLAT, client_id: 5, project_id: 40 },
+        { id: 604, is_logged: true, duration: 3600, started_at: lines[1].first_work, note: 'Mike by hand on the same day', billable: false, service_id: FLAT, client_id: 5, project_id: 40 },
+        { id: 605, is_logged: true, duration: 900, started_at: lines[0].first_work, note: 'Near miss [wbi:acme/widgets#123:2026-10-14]', billable: false, service_id: FLAT, client_id: 5, project_id: 40 },
       );
     };
     const snapshot = (id) => structuredClone(server.state.entries.find((e) => e.id === id));
@@ -682,11 +682,12 @@ describe('freshbooks', () => {
     });
 
     it('shows updates apart from new and unchanged entries in the table, and counts them', async () => {
+      Object.assign(server.state.entries.find((e) => e.id === 602), { client_id: 6, project_id: 41 });
       const table = await cli('plan', '--lines', linesFile(lines), '--format', 'table');
       const section = table.slice(table.indexOf('## Existing entries to update'), table.indexOf('To create:'));
-      assert.match(section, /\| Date \| Note \| Hours \| Rate \| Entry \| Billable \| Service \|/);
-      assert.match(section, /\| 2026-10-14 \| PR #12: Work \[wbi:acme\/widgets#12:2026-10-14\] \| 0\.75 \| flat-rate \(saved mark\) \| 601 \| false → true \| unchanged \|/);
-      assert.match(section, /\| 2026-10-15 \| General development \[wbi:acme\/widgets:2026-10-15\] \| 0\.25 \| flat-rate \(saved mark\) \| 602 \| unchanged \| 9 → 11 \|/);
+      assert.match(section, /\| Date \| Note \| Hours \| Rate \| Entry \| Client \| Project \| Billable \| Service \|/);
+      assert.match(section, /\| 2026-10-14 \| PR #12: Work \[wbi:acme\/widgets#12:2026-10-14\] \| 0\.75 \| flat-rate \(saved mark\) \| 601 \| 5 \| 40 \| false → true \| unchanged \|/);
+      assert.match(section, /\| 2026-10-15 \| General development \[wbi:acme\/widgets:2026-10-15\] \| 0\.25 \| flat-rate \(saved mark\) \| 602 \| 6 \| 41 \| unchanged \| 9 → 11 \|/);
       assert.doesNotMatch(section, /604|605|603|2026-10-17/);
       assert.match(table, /## acme\/widgets\n\n.*\n.*\n\| 2026-10-17 \|/);
       assert.match(table, /To create: 1 entry, 0\.25 h, all billable: 0\.25 h hourly, 0\.00 h flat-rate\./);
@@ -707,12 +708,26 @@ describe('freshbooks', () => {
       assert.doesNotMatch(after, /Approval code/);
     });
 
-    it('PUTs only the changed keys of each update under a matching code, after the creates', async () => {
+    it('PUTs each update as the full listed entry with only the changed keys new, under a matching code, after the creates', async () => {
+      Object.assign(server.state.entries.find((e) => e.id === 602), {
+        is_logged: false,
+        duration: 5400,
+        started_at: '2026-10-15T14:30:00Z',
+        note: `Edited by Mike ${lines[1].tag.toUpperCase()} later`,
+        client_id: 6,
+        project_id: 41,
+        billable: true,
+        service_id: '9',
+      });
       const result = await plan(lines);
       const report = await push(lines, result.approval);
       assert.deepEqual(server.puts().map((r) => [r.path, r.body]), [
-        ['/timetracking/business/77/time_entries/601', { time_entry: { billable: true } }],
-        ['/timetracking/business/77/time_entries/602', { time_entry: { service_id: FLAT } }],
+        ['/timetracking/business/77/time_entries/601', { time_entry: {
+          is_logged: true, started_at: lines[0].first_work, duration: 2700, note: `PR #12: Work ${lines[0].tag}`, client_id: 5, project_id: 40, service_id: FLAT, billable: true,
+        } }],
+        ['/timetracking/business/77/time_entries/602', { time_entry: {
+          is_logged: false, started_at: '2026-10-15T14:30:00Z', duration: 5400, note: `Edited by Mike ${lines[1].tag.toUpperCase()} later`, client_id: 6, project_id: 41, service_id: FLAT, billable: true,
+        } }],
       ]);
       const order = server.state.log.filter((r) => r.path.includes('time_entries') && r.method !== 'GET').map((r) => r.method);
       assert.deepEqual(order, ['POST', 'PUT', 'PUT']);
@@ -754,22 +769,88 @@ describe('freshbooks', () => {
       }
       assert.deepEqual(snapshot(604), before[2]);
       assert.deepEqual(snapshot(605), before[3]);
-      assert.ok(server.puts().every((r) => Object.keys(r.body.time_entry).every((k) => ['billable', 'service_id'].includes(k))));
+      for (const [old, put] of [[before[0], server.puts()[0]], [before[1], server.puts()[1]]]) {
+        const changed = Object.keys(put.body.time_entry).filter((k) => put.body.time_entry[k] !== old[k]);
+        assert.ok(changed.length && changed.every((k) => ['billable', 'service_id'].includes(k)), `entry ${old.id} changed ${changed}`);
+      }
+    });
+
+    it('lets the fake FreshBooks refuse the old partial PUT body with the 422 the real API returned', async () => {
+      const settings = freshbooksSettings(normalizeConfig(JSON.parse(readFileSync(configPath, 'utf8'))));
+      const client = createClient({ settings, keychain, base: server.url, sleep: async () => {} });
+      const before = snapshot(601);
+      await assert.rejects(updateTimeEntry(client, 77, 601, { billable: true }), (error) => {
+        assert.equal(error.status, 422);
+        assert.match(error.message, /PUT \/timetracking\/business\/77\/time_entries\/601 answered HTTP 422: \{"errno":2001,"error":\{"started_at":"Field required","is_logged":"Field required"\}\}/);
+        return true;
+      });
+      await assert.rejects(updateTimeEntry(client, 77, 601, { billable: true, started_at: before.started_at }), /HTTP 422: \{"errno":2001,"error":\{"is_logged":"Field required"\}\}/);
+      await assert.rejects(updateTimeEntry(client, 77, 601, { billable: true, is_logged: true }), /HTTP 422: \{"errno":2001,"error":\{"started_at":"Field required"\}\}/);
+      assert.deepEqual(snapshot(601), before);
+    });
+
+    for (const field of ['is_logged', 'client_id', 'project_id']) {
+      it(`blocks an update when the list leaves out ${field}, which the full PUT body needs, and sends no PUT`, async () => {
+        delete server.state.entries.find((e) => e.id === 601)[field];
+        const result = await plan(lines);
+        assert.equal(result.approval, null);
+        assert.deepEqual(result.update.map((u) => u.id), [602]);
+        assert.deepEqual(result.blocked.map((b) => [b.action, b.reason]), [
+          ['update', `the FreshBooks list did not return ${field} for entry 601, so the plan cannot send the full entry that a FreshBooks update requires`],
+        ]);
+        const table = await cli('plan', '--lines', linesFile(lines), '--format', 'table');
+        assert.match(table, new RegExp(`Cannot update: the FreshBooks list did not return ${field} for entry 601, so the plan cannot send the full entry that a FreshBooks update requires\\.`));
+        await assert.rejects(push(lines, 'deadbeefdeadbeef'), /did not return.*; nothing was created or updated/);
+        assert.deepEqual([server.posts().length, server.puts().length], [0, 0]);
+      });
+    }
+
+    it('names every missing field and entry in one block, and still skips an unchanged entry that lacks one', async () => {
+      delete server.state.entries.find((e) => e.id === 601).client_id;
+      delete server.state.entries.find((e) => e.id === 602).is_logged;
+      delete server.state.entries.find((e) => e.id === 603).project_id;
+      const result = await plan(lines);
+      assert.deepEqual(result.blocked.map((b) => b.reason), ['the FreshBooks list did not return client_id, is_logged for entry 601, entry 602, so the plan cannot send the full entry that a FreshBooks update requires']);
+      assert.deepEqual(result.skip.map((s) => s.existing_id), [603]);
+      assert.deepEqual(result.update, []);
+    });
+
+    it('binds every value of the full PUT body in the approval code', async () => {
+      const { approval } = await plan(lines);
+      const listed = server.state.entries.find((e) => e.id === 601);
+      for (const [key, value] of [['client_id', 6], ['project_id', 41], ['is_logged', false], ['note', `Edited ${listed.note}`], ['started_at', '2026-10-14T18:00:00.000Z'], ['duration', 1234]]) {
+        const old = listed[key];
+        listed[key] = value;
+        assert.notEqual((await plan(lines)).approval, approval, key);
+        await assert.rejects(push(lines, approval), /does not match the current plan/);
+        listed[key] = old;
+      }
+      assert.equal((await plan(lines)).approval, approval);
+      assert.equal(server.puts().length, 0);
     });
 
     it('refuses at push an update that targets an untagged entry or changes another field, and changes nothing', async () => {
       const settings = freshbooksSettings(normalizeConfig(JSON.parse(readFileSync(configPath, 'utf8'))));
       const client = createClient({ settings, keychain, base: server.url, sleep: async () => {} });
       const listed = snapshot(601);
-      const good = { tag: lines[0].tag, id: 601, repo: 'acme/widgets', note: listed.note, duration: listed.duration, started_at: listed.started_at, from: { billable: false }, to: { billable: true } };
+      const { id, ...body } = listed;
+      const good = { tag: lines[0].tag, id, repo: 'acme/widgets', from: { billable: false }, to: { billable: true }, time_entry: { ...body, billable: true } };
       const attempt = (u) => {
         const crafted = { business_id: 77, blocked: [], create: [], update: [u], skip: [] };
         return pushPlan({ client, plan: { ...crafted, approval: approvalCode(77, [], [u]) }, approval: approvalCode(77, [], [u]) });
       };
+      const without = (key) => Object.fromEntries(Object.entries(good.time_entry).filter(([k]) => k !== key));
       for (const bad of [
-        { ...good, id: 604, note: 'Mike by hand on the same day' },
+        { ...good, id: 604, time_entry: { ...good.time_entry, note: 'Mike by hand on the same day' } },
+        { ...good, time_entry: { ...good.time_entry, billable: false } },
+        { ...good, time_entry: { ...good.time_entry, rate: 0 } },
+        { ...good, time_entry: without('started_at') },
+        { ...good, time_entry: without('is_logged') },
+        { ...good, time_entry: { ...without('client_id'), stray: 5 } },
+        { ...good, time_entry: undefined },
         { ...good, tag: 'mike' },
         { ...good, to: { billable: true, duration: 60 } },
+        { ...good, to: { billable: true, duration: good.time_entry.duration } },
         { ...good, to: { note: 'x' } },
         { ...good, to: {} },
         { ...good, id: '601' },
@@ -898,6 +979,43 @@ describe('freshbooks', () => {
       assert.equal(server.puts().length, 0);
     });
 
+    for (const [field, value] of [['is_logged', null], ['is_logged', 'true'], ['duration', null], ['started_at', '2026-10-14T99:99:99Z']]) {
+      it(`blocks an update whose listed ${field} is ${JSON.stringify(value)}, and sends no PUT`, async () => {
+        server.state.entries.find((e) => e.id === 601)[field] = value;
+        const result = await plan(lines);
+        assert.equal(result.approval, null);
+        assert.deepEqual(result.update.map((u) => u.id), [602]);
+        assert.deepEqual(result.blocked.map((b) => [b.action, b.reason]), [
+          ['update', `the FreshBooks list returned no valid ${field} for entry 601, so the plan cannot send the full entry that a FreshBooks update requires`],
+        ]);
+        const table = await cli('plan', '--lines', linesFile(lines), '--format', 'table');
+        assert.match(table, new RegExp(`Cannot update: the FreshBooks list returned no valid ${field} for entry 601`));
+        await assert.rejects(push(lines, 'deadbeefdeadbeef'), /returned no valid.*; nothing was created or updated/);
+        assert.deepEqual([server.posts().length, server.puts().length], [0, 0]);
+      });
+    }
+
+    it('stops at an update whose PUT response leaves out a field it sent, as possibly changed', async () => {
+      const { approval } = await plan(lines);
+      const { client_id: dropped, ...listed } = snapshot(601);
+      server.state.failures.push({ method: 'PUT', path: '/601', status: 200, body: { time_entry: { ...listed, billable: true } } });
+      await assert.rejects(push(lines, approval), (error) => {
+        assert.equal(dropped, 5);
+        assert.equal(error.report.failed.changed, 'unknown');
+        assert.match(error.report.failed.error, /shows entry 601 with a changed client_id; check FreshBooks before a rerun/);
+        assert.deepEqual(error.report.not_attempted, [lines[1].tag]);
+        return true;
+      });
+      assert.deepEqual(server.puts().map((r) => r.path.split('/').at(-1)), ['601']);
+    });
+
+    it('allows a null client_id or project_id on an entry to update, and sends it back as null', async () => {
+      Object.assign(server.state.entries.find((e) => e.id === 601), { client_id: null, project_id: null });
+      await push(lines, (await plan(lines)).approval);
+      const put = server.puts().find((r) => r.path.endsWith('/601'));
+      assert.deepEqual([put.body.time_entry.client_id, put.body.time_entry.project_id], [null, null]);
+    });
+
     it('blocks when the list leaves out duration or started_at, which the PUT check needs', async () => {
       delete server.state.entries.find((e) => e.id === 601).duration;
       const result = await plan(lines);
@@ -909,6 +1027,10 @@ describe('freshbooks', () => {
       ['note', (e) => ({ ...e, note: undefined })],
       ['duration', (e) => ({ ...e, duration: 0 })],
       ['started_at', (e) => ({ ...e, started_at: '2026-10-14T00:00:00.000Z' })],
+      ['client_id', (e) => ({ ...e, client_id: 6 })],
+      ['project_id', (e) => ({ ...e, project_id: 41 })],
+      ['is_logged', (e) => ({ ...e, is_logged: false })],
+      ['service_id', (e) => ({ ...e, service_id: 9 })],
     ]) {
       it(`stops at an update whose PUT response shows a changed ${field}, as possibly changed`, async () => {
         const { approval } = await plan(lines);

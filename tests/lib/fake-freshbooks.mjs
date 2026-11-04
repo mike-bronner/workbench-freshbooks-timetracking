@@ -93,6 +93,8 @@ export async function fakeFreshbooks({ events = [], redirectUri = 'https://local
     ['PUT', /^\/timetracking\/business\/77\/time_entries\/\d+$/, (url, body) => {
       const entry = state.entries.find((e) => e.id === Number(url.pathname.split('/').at(-1)));
       if (!entry) return [404, { error: 'no entry' }];
+      const missing = ['started_at', 'is_logged'].filter((key) => !Object.hasOwn(body?.time_entry ?? {}, key));
+      if (missing.length) return [422, { errno: 2001, error: Object.fromEntries(missing.map((key) => [key, 'Field required'])) }];
       Object.assign(entry, body.time_entry);
       return [200, { time_entry: entry }];
     }],

@@ -213,9 +213,10 @@ of first work, with a total per repo. Each line shows:
 
 A section "Existing entries to update" follows when FreshBooks holds tagged
 entries whose billable flag or service differs from what the plan would create
-now. Each row shows the entry id and, for both fields, the old and new value
-or "unchanged". An update changes only those two fields, never the duration,
-the date or the note.
+now. Each row shows the entry id, its client and project, and, for both fields,
+the old and new value or "unchanged". An update changes only those two fields,
+never the duration, the date or the note. It sends every other field back as
+FreshBooks holds it.
 
 A "To create" line gives the number of new entries, their hours, and how those
 hours split into hourly and flat-rate hours. A "To update" line gives the
