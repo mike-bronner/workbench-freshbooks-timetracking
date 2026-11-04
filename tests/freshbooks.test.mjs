@@ -1309,6 +1309,110 @@ describe('freshbooks', () => {
       assert.deepEqual(result.blocked.map((b) => b.reason), ['entry 808 still carries the internal key acme/widgets:2026-10-07, but this estimate holds no work in that repo on that day to relabel it with']);
     });
 
+    it('relabels a general tag that no line can relabel from a tagged PR entry of the same repo and day, and keeps everything else', async () => {
+      server.state.entries.push(
+        held(808, at('2026-10-07 09:00:00'), 'General development [wbi:acme/widgets:2026-10-07]', { service_id: FLAT, billable: false, duration: 5400 }),
+        held(830, at('2026-10-07 11:00:00'), 'PR #50: Fix ✨ [wbi:acme/widgets#50:2026-10-07]'),
+      );
+      const result = await plan(lines);
+      assert.deepEqual(result.blocked, []);
+      assert.match(result.approval, /^[0-9a-f]{16}$/);
+      const relabel = result.update.find((u) => u.id === 808);
+      assert.deepEqual(
+        [relabel.key, relabel.rate, relabel.via, relabel.relabelled_from, relabel.from, relabel.to],
+        ['acme/widgets:2026-10-07', 'as stored', 'same-day', 830, { note: 'General development [wbi:acme/widgets:2026-10-07]' }, { note: 'PR #50: Fix ✨' }],
+      );
+      assert.deepEqual(relabel.time_entry, {
+        is_logged: true, started_at: at('2026-10-07 09:00:00'), duration: 5400, note: 'PR #50: Fix ✨', client_id: 5, project_id: 40, service_id: FLAT, billable: false,
+      });
+      assert.equal(result.update.find((u) => u.id === 830).via, 'tag');
+      const table = await cli('plan', '--lines', linesFile(lines), '--format', 'table');
+      assert.match(table, /\| 808 \| relabelled from same-day entry 830 \|/);
+      await push(lines, result.approval);
+      const stored = server.state.entries.find((e) => e.id === 808);
+      assert.deepEqual([stored.note, stored.billable, stored.service_id, stored.duration, stored.started_at], ['PR #50: Fix ✨', false, FLAT, 5400, at('2026-10-07 09:00:00')]);
+      assert.ok(server.state.entries.every((e) => !/\[wbi:|acme\/widgets[#:]/.test(e.note)));
+      assert.deepEqual(ledger().entries['acme/widgets:2026-10-07'], [808]);
+      assert.deepEqual(ledger().entries['acme/widgets#50:2026-10-07'], [830]);
+    });
+
+    it('still blocks when the only PR entries are untagged, of another repo, or of another day', async () => {
+      server.state.entries.push(
+        held(808, at('2026-10-07 09:00:00'), 'General development [wbi:acme/widgets:2026-10-07]'),
+        held(840, at('2026-10-07 10:00:00'), 'PR #50: Hand', { duration: 7200 }),
+        held(841, at('2026-10-07 11:00:00'), 'PR #50: Other [wbi:acme/gadgets#50:2026-10-07]', { duration: 7200 }),
+        held(842, at('2026-10-07 12:00:00'), 'PR #50: Later [wbi:acme/widgets#50:2026-10-08]', { duration: 7200 }),
+        held(843, at('2026-10-07 13:00:00'), 'General development [wbi:acme/widgets:2026-10-07]', { duration: 7200 }),
+      );
+      const result = await plan(lines);
+      assert.equal(result.approval, null);
+      assert.deepEqual(result.blocked.map((b) => b.reason), [
+        'entry 808 still carries the internal key acme/widgets:2026-10-07, but this estimate holds no work in that repo on that day to relabel it with',
+        'entry 843 still carries the internal key acme/widgets:2026-10-07, but this estimate holds no work in that repo on that day to relabel it with',
+      ]);
+      assert.ok(result.update.every((u) => ![808, 843].includes(u.id)));
+      assert.throws(() => readFileSync(ledgerFile()), /ENOENT/);
+    });
+
+    it('relabels from the longest same-day entry, and the lowest id on a tie', async () => {
+      server.state.entries.push(
+        held(808, at('2026-10-07 09:00:00'), 'General development [wbi:acme/widgets:2026-10-07]'),
+        held(831, at('2026-10-07 10:00:00'), 'PR #50: Short [wbi:acme/widgets#50:2026-10-07]', { duration: 900 }),
+        held(833, at('2026-10-07 11:00:00'), 'PR #52: Tie [wbi:acme/widgets#52:2026-10-07]', { duration: 1800 }),
+        held(832, at('2026-10-07 12:00:00'), 'Issue #7: Docs [wbi:acme/widgets#7:2026-10-07]', { duration: 1800 }),
+      );
+      const result = await plan(lines);
+      assert.deepEqual(result.blocked, []);
+      assert.match(result.approval, /^[0-9a-f]{16}$/);
+      const relabel = result.update.find((u) => u.id === 808);
+      assert.deepEqual([relabel.relabelled_from, relabel.to], [832, { note: 'Issue #7: Docs' }]);
+      await push(lines, result.approval);
+      assert.equal(server.state.entries.find((e) => e.id === 808).note, 'Issue #7: Docs');
+      assert.ok(server.state.entries.every((e) => !/\[wbi:/i.test(e.note)));
+    });
+
+    it('blocks a tagged entry whose note without its key is empty or still holds an internal key, and lends neither note', async () => {
+      server.state.entries.push(
+        held(808, at('2026-10-07 09:00:00'), 'General development [wbi:acme/widgets:2026-10-07]'),
+        held(832, at('2026-10-07 12:00:00'), 'Issue #7: Docs [wbi:acme/widgets#7:2026-10-07]', { duration: 1800 }),
+        held(834, at('2026-10-07 13:00:00'), '[wbi:acme/widgets#53:2026-10-07]', { duration: 3600 }),
+        held(835, at('2026-10-07 14:00:00'), 'PR #54: Odd [wbi:acme] [wbi:acme/widgets#54:2026-10-07]', { duration: 3600 }),
+      );
+      const result = await plan(lines);
+      assert.equal(result.approval, null);
+      assert.deepEqual(result.blocked.map((b) => b.reason), [
+        'entry 834 still carries the internal key acme/widgets#53:2026-10-07, but its note without that key is empty or still holds an internal key, so the plan has no label to give it',
+        'entry 835 still carries the internal key acme/widgets#54:2026-10-07, but its note without that key is empty or still holds an internal key, so the plan has no label to give it',
+      ]);
+      assert.ok(result.update.every((u) => ![834, 835].includes(u.id)));
+      const relabel = result.update.find((u) => u.id === 808);
+      assert.deepEqual([relabel.relabelled_from, relabel.to], [832, { note: 'Issue #7: Docs' }]);
+    });
+
+    it('still blocks when the only same-day entry belongs to another project', async () => {
+      server.state.entries.push(
+        held(808, at('2026-10-07 09:00:00'), 'General development [wbi:acme/widgets:2026-10-07]'),
+        held(850, at('2026-10-07 10:00:00'), 'PR #50: Elsewhere [wbi:acme/widgets#50:2026-10-07]', { project_id: 41, client_id: 6 }),
+      );
+      const result = await plan(lines);
+      assert.equal(result.approval, null);
+      assert.deepEqual(result.blocked.map((b) => b.reason), ['entry 808 still carries the internal key acme/widgets:2026-10-07, but this estimate holds no work in that repo on that day to relabel it with']);
+      assert.ok(result.update.every((u) => u.id !== 808));
+    });
+
+    it('never lends the note of an entry with no valid id or no finite duration', async () => {
+      server.state.entries.push(
+        held(808, at('2026-10-07 09:00:00'), 'General development [wbi:acme/widgets:2026-10-07]'),
+        held(832, at('2026-10-07 12:00:00'), 'Issue #7: Docs [wbi:acme/widgets#7:2026-10-07]', { duration: 1800 }),
+        held(0, at('2026-10-07 13:00:00'), 'PR #60: Zero [wbi:acme/widgets#60:2026-10-07]', { duration: 7200 }),
+        held(829, at('2026-10-07 14:00:00'), 'PR #61: Text [wbi:acme/widgets#61:2026-10-07]', { duration: '9999' }),
+      );
+      const result = await plan(lines);
+      assert.equal(result.approval, null);
+      const relabel = result.update.find((u) => u.id === 808);
+      assert.deepEqual([relabel.via, relabel.relabelled_from, relabel.to], ['same-day', 832, { note: 'Issue #7: Docs' }]);
+    });
+
     it('leaves a tagged entry of a repo or day outside the estimate alone', async () => {
       server.state.entries.push(
         held(809, at('2026-10-06 12:00:00'), 'PR #9: Else [wbi:acme/other#9:2026-10-06]'),

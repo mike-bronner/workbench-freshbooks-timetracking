@@ -222,7 +222,12 @@ config, from an older `[wbi:…]` tag in the note, or from a note equal to the
 line's label on the same day and project. A note changes only when it still
 carries an older tag: the Note cell then shows the old note, an arrow and the
 new label. That drops the tag, and relabels a former "General development"
-entry with the PR or issue its time now belongs to. Each row also shows the
+entry with the PR or issue its time now belongs to. When no line holds work in
+that repo on that day, a former "General development" entry takes the note of
+the longest tagged PR or issue entry of the same repo, project and day,
+without its tag. Its Match cell then reads "relabelled from same-day entry"
+and that entry's id. Tell Mike in one sentence that this note is a guess from
+FreshBooks, and that its rate stays as stored. Each row also shows the
 entry id, how the plan matched it ("ledger" or "older tag"), its client and
 project, and, for the billable flag and the service,
 the old and new value or "unchanged". An update never changes the duration or

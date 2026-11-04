@@ -161,6 +161,10 @@ bin/push.sh --lines lines.json --approve <code>
   flat-rate when the day carries a flat-rate mark, hourly otherwise, whatever
   the rate of the line that took over its time. A tagged entry in the range and repos of the
   lines that no line matches loses its tag, and keeps everything else.
+  When that tag is a general one, no line can relabel the entry. It then
+  takes the note of a tagged PR or issue entry in the same repo, project and
+  day, without its tag. The longest such entry gives the note, and on equal
+  durations the one with the lowest id.
   An update never touches the duration or the date, and never an entry that
   is neither in the ledger nor tagged. The plan prints
   one approval code that covers each new entry and each update, so a changed
@@ -178,11 +182,14 @@ bin/push.sh --lines lines.json --approve <code>
   - One entry matches more than one line.
   - The ledger records an entry that FreshBooks does not list for that window.
   - An entry still carries the tag of a general line that no line of the
-    estimate can relabel.
+    estimate can relabel, and no tagged PR or issue entry of that repo,
+    project and day can give it a note.
+  - A tagged entry that no line matches has a note that is empty, or still
+    holds an internal key, once its tag is dropped.
 - The plan table groups the new entries by repo in order of first work, shows
   the rate of each line, marks git-sourced lines, and splits hourly from
   flat-rate hours. A separate section lists the updates with the client and
-  project of each entry, and how the plan matched it (ledger or older tag), and a list names the unchanged entries.
+  project of each entry, and how the plan matched it (ledger, older tag, or relabelled from a same-day entry), and a list names the unchanged entries.
 - `push.sh` builds the plan again, and creates and updates entries only when
   the code matches, so a changed line set, a changed mark or a changed
   FreshBooks entry needs a new review. It changes nothing while the plan has
