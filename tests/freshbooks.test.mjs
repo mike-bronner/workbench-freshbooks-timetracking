@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { get } from 'node:https';
+import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { after, afterEach, beforeEach, describe, it } from 'node:test';
@@ -9,7 +12,7 @@ import { freshbooksSettings, normalizeConfig, updateConfig } from '../lib/config
 import { apiBase, createClient, pickBusiness } from '../lib/freshbooks/api.mjs';
 import { run } from '../lib/freshbooks/cli.mjs';
 import { ACCESS_TOKEN, CLIENT_SECRET as SECRET_ACCOUNT, REFRESH_TOKEN, SERVICE, systemKeychain } from '../lib/freshbooks/keychain.mjs';
-import { waitForCode } from '../lib/freshbooks/login.mjs';
+import { selfSignedCert, waitForCode } from '../lib/freshbooks/login.mjs';
 import { lastBilledDate } from '../lib/freshbooks/plan.mjs';
 import { localDate, rangeChoices, zonedMidnight } from '../lib/time.mjs';
 import { CLIENT_ID, CLIENT_SECRET, fakeFreshbooks } from './lib/fake-freshbooks.mjs';
@@ -328,7 +331,7 @@ describe('freshbooks', () => {
         return res;
       };
       server.state.failures.push({ method: 'GET', path: '/clients', status: 401 }, { method: 'GET', path: '/projects', status: 401 });
-      const client = createClient({ settings: { client_id: CLIENT_ID, redirect_uri: 'https://localhost:8080/callback' }, keychain, fetch, base: server.url });
+      const client = createClient({ settings: { client_id: CLIENT_ID, redirect_uri: 'https://localhost:8443' }, keychain, fetch, base: server.url });
       await Promise.all([client.request('GET', '/accounting/account/acct9/users/clients'), client.request('GET', '/projects/business/77/projects')]);
       assert.equal(tokenCalls().length, 1);
     });
@@ -384,12 +387,172 @@ describe('freshbooks', () => {
       assert.ok(widgets !== -1 && gadgets !== -1 && widgets < gadgets, table);
       const widgetRows = table.slice(widgets, gadgets).split('\n').filter((r) => r.startsWith('| 2026'));
       assert.deepEqual(widgetRows.map((r) => r.slice(2, 12)), ['2026-10-12', '2026-10-15']);
-      assert.ok(widgetRows.every((r) => r.includes('| session |')));
-      assert.match(table.slice(gadgets), /\| 2026-10-13 \| .* \| 0\.25 \| git \(fallback\) \| 6 \| 41 \| 9 \|/);
+      assert.ok(widgetRows.every((r) => r.includes('| hourly | session |')));
+      assert.match(table.slice(gadgets), /\| 2026-10-13 \| .* \| 0\.25 \| hourly \| git \(fallback\) \| 6 \| 41 \| 9 \|/);
       assert.match(table.slice(widgets, gadgets), /\| \| \*\*Total\*\* \| 0\.75 \|/);
-      assert.match(table, /To create: 3 entries, 1\.00 h\./);
+      assert.match(table, /To create: 3 entries, 1\.00 h: 1\.00 h billable \(hourly\), 0\.00 h non-billable \(flat-rate\)\./);
       assert.match(table, /Already in FreshBooks, skipped:\n\n- General development `\[wbi:acme\/widgets:2026-10-16\]` \(entry 501\)/);
       assert.match(table, /Approval code: [0-9a-f]{16}/);
+    });
+  });
+
+  describe('flat rate', () => {
+    const FLAT = 11;
+    const lines = [line({ date: '2026-10-14', pr: 12, hours: 0.75 }), line({ date: '2026-10-15', pr: 12, hours: 0.5 }), line({ date: '2026-10-15', pr: 13, first: '2026-10-15 11:00:00' }), line({ date: '2026-10-16' })];
+    const withFlatService = () => updateConfig(configPath, (raw) => {
+      raw.freshbooks.repos['acme/widgets'] = { ...MAPPING, flat_rate_service_id: FLAT };
+    });
+    const flatRate = async (...args) => JSON.parse(await cli('flat-rate', '--lines', linesFile(lines), ...args));
+    const savedMarks = () => JSON.parse(readFileSync(configPath, 'utf8')).freshbooks.flat_rate_prs;
+
+    beforeEach(() => {
+      server.state.services.push({ id: FLAT, name: 'Milestone', vis_state: 0 });
+    });
+
+    it('maps an hourly and a flat-rate service, both checked against FreshBooks', async () => {
+      const out = JSON.parse(await cli('map', '--repo', 'acme/gadgets', '--client', '5', '--project', '40', '--service', '9', '--flat-rate-service', String(FLAT)));
+      assert.deepEqual(out.saved, { repo: 'acme/gadgets', client_id: 5, project_id: 40, service_id: 9, flat_rate_service_id: FLAT });
+      assert.deepEqual(JSON.parse(readFileSync(configPath, 'utf8')).freshbooks.repos['acme/gadgets'], { client_id: 5, project_id: 40, service_id: 9, flat_rate_service_id: FLAT });
+      const unmapped = JSON.parse(await cli('unmapped', '--repo', 'acme/gadgets'));
+      assert.equal(unmapped.mapped[0].flat_rate_service_id, FLAT);
+    });
+
+    it('refuses a hidden, unknown or hourly flat-rate service, and leaves the config alone', async () => {
+      const before = readFileSync(configPath, 'utf8');
+      const map = (flat) => cli('map', '--repo', 'acme/gadgets', '--client', '5', '--project', '40', '--service', '9', '--flat-rate-service', flat);
+      await assert.rejects(map('10'), /service 10 is not an active service/);
+      await assert.rejects(map('99'), /service 99 is not an active service/);
+      await assert.rejects(map('9'), /flat-rate service must differ from the hourly service/);
+      await assert.rejects(map('x'), /--flat-rate-service must be a positive integer/);
+      assert.equal(readFileSync(configPath, 'utf8'), before);
+    });
+
+    it('lists the PRs of the lines as hourly until one is marked', async () => {
+      const out = await flatRate();
+      assert.deepEqual(out.pull_requests, [
+        { ref: 'acme/widgets#12', repo: 'acme/widgets', pr: 12, label: 'PR #12: Work', flat_rate: false, lines: 2, billable_hours: 1.25, description: 'hourly, 2 line(s), 1.25 h' },
+        { ref: 'acme/widgets#13', repo: 'acme/widgets', pr: 13, label: 'PR #13: Work', flat_rate: false, lines: 1, billable_hours: 0.25, description: 'hourly, 1 line(s), 0.25 h' },
+      ]);
+      assert.equal(savedMarks(), undefined);
+    });
+
+    it('saves a mark per PR, applies it on a later run, and clears it', async () => {
+      withFlatService();
+      const marked = await flatRate('--mark', 'Acme/Widgets#13', '--mark', 'acme/widgets#12');
+      assert.deepEqual(marked.marked, ['acme/widgets#13', 'acme/widgets#12']);
+      assert.deepEqual(savedMarks(), { 'acme/widgets': [12, 13] });
+      assert.deepEqual(marked.pull_requests.map((p) => [p.ref, p.flat_rate, p.description]), [
+        ['acme/widgets#12', true, 'flat-rate (saved mark), 2 line(s), 1.25 h'],
+        ['acme/widgets#13', true, 'flat-rate (saved mark), 1 line(s), 0.25 h'],
+      ]);
+      const later = await plan(lines);
+      assert.deepEqual(later.create.map((e) => [e.tag, e.rate, e.time_entry.billable, e.time_entry.service_id]), [
+        ['[wbi:acme/widgets#12:2026-10-14]', 'flat-rate', false, FLAT],
+        ['[wbi:acme/widgets#12:2026-10-15]', 'flat-rate', false, FLAT],
+        ['[wbi:acme/widgets#13:2026-10-15]', 'flat-rate', false, FLAT],
+        ['[wbi:acme/widgets:2026-10-16]', 'hourly', true, 9],
+      ]);
+      const cleared = await flatRate('--clear', 'acme/widgets#13');
+      assert.deepEqual(cleared.cleared, ['acme/widgets#13']);
+      assert.deepEqual(savedMarks(), { 'acme/widgets': [12] });
+      assert.deepEqual((await plan(lines)).create.map((e) => e.rate), ['flat-rate', 'flat-rate', 'hourly', 'hourly']);
+      await flatRate('--clear', 'acme/widgets#12');
+      assert.deepEqual(savedMarks(), {});
+      assert.ok((await plan(lines)).create.every((e) => e.rate === 'hourly' && e.time_entry.billable));
+    });
+
+    it('refuses a mark for a PR that is not a PR line, a clear with no saved mark, or a bad ref, and saves nothing', async () => {
+      await flatRate('--mark', 'acme/widgets#12');
+      const before = readFileSync(configPath, 'utf8');
+      await assert.rejects(flatRate('--mark', 'acme/widgets#99'), /acme\/widgets#99 is not a PR line in .*; nothing was saved/);
+      await assert.rejects(flatRate('--mark', 'acme/widgets#13', '--mark', 'acme/gadgets#13'), /acme\/gadgets#13 is not a PR line/);
+      await assert.rejects(flatRate('--clear', 'acme/widgets#13'), /acme\/widgets#13 has no saved flat-rate mark; nothing was saved/);
+      await assert.rejects(flatRate('--mark', 'acme/widgets#13', '--clear', 'acme/widgets#13'), /both marked and cleared/);
+      await assert.rejects(flatRate('--mark', 'acme/widgets'), /owner\/name#pr/);
+      await assert.rejects(flatRate('--mark', 'acme/widgets#0'), /owner\/name#pr/);
+      assert.equal(readFileSync(configPath, 'utf8'), before);
+    });
+
+    it('treats only PR lines as flat-rate, even when another line carries a marked number', async () => {
+      withFlatService();
+      await flatRate('--mark', 'acme/widgets#12');
+      const issue = { ...line({ date: '2026-10-17', pr: 12 }), kind: 'issue', issue: 12, label: 'Issue #12: Work' };
+      const result = await plan([lines[0], issue]);
+      assert.deepEqual(result.create.map((e) => [e.rate, e.pr]), [['flat-rate', 12], ['hourly', null]]);
+    });
+
+    it('posts a flat-rate line as non-billable under the flat-rate service, and an hourly line as before, with the same tag form', async () => {
+      withFlatService();
+      await flatRate('--mark', 'acme/widgets#12');
+      const reviewed = [lines[0], lines[3]];
+      await push(reviewed, (await plan(reviewed)).approval);
+      assert.deepEqual(server.posts().map((p) => p.body), [
+        { time_entry: { is_logged: true, duration: 2700, started_at: '2026-10-14T17:00:00.000Z', note: 'PR #12: Work [wbi:acme/widgets#12:2026-10-14]', billable: false, client_id: 5, project_id: 40, service_id: FLAT } },
+        { time_entry: { is_logged: true, duration: 900, started_at: '2026-10-16T17:00:00.000Z', note: 'General development [wbi:acme/widgets:2026-10-16]', billable: true, client_id: 5, project_id: 40, service_id: 9 } },
+      ]);
+    });
+
+    it('voids an approval when a line is marked or unmarked after it', async () => {
+      withFlatService();
+      const hourly = (await plan(lines)).approval;
+      await flatRate('--mark', 'acme/widgets#12');
+      await assert.rejects(push(lines, hourly), /does not match the current plan; nothing was created/);
+      const flat = (await plan(lines)).approval;
+      assert.notEqual(flat, hourly);
+      await flatRate('--clear', 'acme/widgets#12');
+      await assert.rejects(push(lines, flat), /does not match the current plan; nothing was created/);
+      assert.equal(server.posts().length, 0);
+    });
+
+    it('shows the rate of each line and splits billable from non-billable hours in the table', async () => {
+      withFlatService();
+      await flatRate('--mark', 'acme/widgets#12');
+      const table = await cli('plan', '--lines', linesFile(lines), '--format', 'table');
+      const rows = table.split('\n').filter((r) => r.startsWith('| 2026'));
+      assert.deepEqual(rows.map((r) => r.split(' | ').slice(3, 4).concat(r.split(' | ').at(-1))), [
+        ['flat-rate (saved mark)', '11 |'],
+        ['flat-rate (saved mark)', '11 |'],
+        ['hourly', '9 |'],
+        ['hourly', '9 |'],
+      ]);
+      assert.match(table, /To create: 4 entries, 1\.75 h: 0\.50 h billable \(hourly\), 1\.25 h non-billable \(flat-rate\)\./);
+      assert.match(table, /Approval code: [0-9a-f]{16}/);
+    });
+
+    it('blocks a repo with flat-rate lines but no flat-rate service, says why, and creates nothing', async () => {
+      const before = (await plan(lines)).approval;
+      await flatRate('--mark', 'acme/widgets#13');
+      const blocked = await plan(lines);
+      assert.equal(blocked.approval, null);
+      assert.deepEqual(blocked.blocked.map((b) => b.repo), ['acme/widgets']);
+      const table = await cli('plan', '--lines', linesFile(lines), '--format', 'table');
+      assert.match(table, /\| 2026-10-15 \| PR #13: Work .* \| flat-rate \(saved mark\) \| session \| 5 \| 40 \| none \|/);
+      assert.match(table, /Cannot create: acme\/widgets has lines marked flat-rate but no flat-rate service mapped\. Map one with map\.sh --flat-rate-service, or clear the marks with flat-rate\.sh\./);
+      assert.match(table, /No approval code until every flat-rate line has a service\./);
+      assert.doesNotMatch(table, /Approval code:/);
+      for (const code of [before, 'null', 'deadbeefdeadbeef']) {
+        await assert.rejects(push(lines, code), /no flat-rate service mapped.*; nothing was created/);
+      }
+      assert.equal(server.posts().length, 0);
+    });
+
+    it('does not block a flat-rate line that FreshBooks already holds', async () => {
+      await flatRate('--mark', 'acme/widgets#13');
+      server.state.entries.push({ id: 502, started_at: at('2026-10-15 11:00:00'), note: 'PR #13: Work [wbi:acme/widgets#13:2026-10-15]' });
+      const result = await plan(lines);
+      assert.deepEqual(result.blocked, []);
+      assert.match(result.approval, /^[0-9a-f]{16}$/);
+    });
+
+    it('refuses a PR line whose pr does not match its tag', async () => {
+      await assert.rejects(plan([{ ...line({ date: '2026-10-14', pr: 12 }), pr: 13 }]), /PR line whose pr does not match its tag/);
+      await assert.rejects(plan([{ ...line({ date: '2026-10-14', pr: 12 }), pr: '12' }]), /PR line whose pr does not match its tag/);
+      await assert.rejects(plan([{ ...line({ date: '2026-10-14', pr: 12 }), pr: 0, tag: '[wbi:acme/widgets#0:2026-10-14]' }]), /PR line whose pr does not match its tag/);
+    });
+
+    it('accepts a PR line whose repo is not lower case', async () => {
+      const result = await plan([line({ date: '2026-10-14', pr: 12, repo: 'Acme/Widgets' })]);
+      assert.deepEqual(result.create.map((e) => [e.tag, e.pr]), [['[wbi:acme/widgets#12:2026-10-14]', 12]]);
     });
   });
 
@@ -486,7 +649,7 @@ describe('freshbooks', () => {
         config_path: configPath,
         config_exists: true,
         settings: { human_minutes_per_ai_hour: 20, idle_gap_minutes: 15, rounding_step_hours: 0.25, timezone: TZ, timezone_follows_system: false },
-        freshbooks: { client_id: CLIENT_ID, redirect_uri: 'https://localhost:8080/callback', business_id: 77, account_id: 'acct9', mapped_repos: ['acme/widgets'] },
+        freshbooks: { client_id: CLIENT_ID, redirect_uri: 'https://localhost:8443', business_id: 77, account_id: 'acct9', mapped_repos: ['acme/widgets'] },
         system_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         client_secret_saved: true,
         logged_in: true,
@@ -560,7 +723,8 @@ describe('freshbooks settings', () => {
   const settings = (freshbooks) => freshbooksSettings(normalizeConfig({ ...config(), freshbooks }));
 
   it('defaults the redirect URI and lets config override it', () => {
-    assert.equal(settings({}).redirect_uri, 'https://localhost:8080/callback');
+    assert.equal(settings({}).redirect_uri, 'https://localhost:8443');
+    assert.equal(settings({ redirect_uri: 'https://localhost:8443' }).redirect_uri, 'https://localhost:8443');
     assert.equal(settings({ redirect_uri: 'https://127.0.0.1:9443/cb' }).redirect_uri, 'https://127.0.0.1:9443/cb');
   });
 
@@ -574,8 +738,94 @@ describe('freshbooks settings', () => {
     assert.throws(() => settings({ repos: { 'acme/widgets': { client_id: 5, project_id: 40 } } }), /needs positive integer/);
   });
 
-  it('refuses to listen for a redirect URI that is not on this machine', () => {
-    assert.throws(() => waitForCode({ redirectUri: 'https://example.com/callback', state: 's', cert: {}, log: () => {} }), /not localhost or 127\.0\.0\.1/);
+  it('loads a mapping with one service, or with a flat-rate service too, and no saved marks', () => {
+    assert.deepEqual(settings({ repos: { 'acme/widgets': MAPPING } }).repos, { 'acme/widgets': MAPPING });
+    assert.deepEqual(settings({ repos: { 'acme/widgets': { ...MAPPING, flat_rate_service_id: 11 } } }).repos['acme/widgets'].flat_rate_service_id, 11);
+    assert.deepEqual(settings({}).flat_rate_prs, {});
+  });
+
+  it('refuses a flat-rate service that is not an id or equals the hourly service', () => {
+    for (const flat of [0, '11', 9, null]) {
+      assert.throws(() => settings({ repos: { 'acme/widgets': { ...MAPPING, flat_rate_service_id: flat } } }), /flat_rate_service_id must be a positive integer other than service_id/);
+    }
+  });
+
+  it('refuses saved marks that are not distinct PR numbers under a lower-case repo', () => {
+    assert.deepEqual(settings({ flat_rate_prs: { 'acme/widgets': [12, 13] } }).flat_rate_prs, { 'acme/widgets': [12, 13] });
+    assert.throws(() => settings({ flat_rate_prs: [] }), /flat_rate_prs must be an object/);
+    assert.throws(() => settings({ flat_rate_prs: { 'Acme/Widgets': [12] } }), /flat_rate_prs key "Acme\/Widgets" must be a lower-case owner\/name/);
+    for (const prs of [[12, 12], [0], ['12'], 12]) {
+      assert.throws(() => settings({ flat_rate_prs: { 'acme/widgets': prs } }), /must be a list of distinct PR numbers/);
+    }
+  });
+
+  it('refuses to listen for a redirect URI that is not on this machine', async () => {
+    await assert.rejects(waitForCode({ redirectUri: 'https://example.com/callback', state: 's', cert: {}, log: () => {} }), /not localhost or 127\.0\.0\.1/);
+  });
+
+  const occupy = (address = '127.0.0.1') => new Promise((resolve) => {
+    const blocker = createServer((socket) => socket.end());
+    blocker.once('error', () => resolve(null));
+    blocker.listen(0, address, () => resolve(blocker));
+  });
+
+  for (const [host, address] of [['localhost', '127.0.0.1'], ['localhost', '::1'], ['127.0.0.1', '127.0.0.1']]) {
+    it(`fails at once, naming the port, when another process holds the ${host} redirect port on ${address}`, async (t) => {
+      const blocker = await occupy(address);
+      if (!blocker) return t.skip(`this machine cannot listen on ${address}`);
+      const { port } = blocker.address();
+      const started = Date.now();
+      try {
+        await assert.rejects(
+          waitForCode({ redirectUri: `https://${host}:${port}`, state: 's', cert: selfSignedCert(), timeoutMs: 4000, onListening: () => {}, log: () => {} }),
+          (error) => {
+            assert.match(error.message, new RegExp(`port ${port} on ${host} is already in use by another process`));
+            assert.match(error.message, /\/workbench-freshbooks-timetracking:setup to pick another redirect URI/);
+            assert.match(error.message, /set the same URI on the FreshBooks app/);
+            return true;
+          },
+        );
+        assert.ok(Date.now() - started < 3000);
+      } finally {
+        blocker.close();
+      }
+    });
+  }
+
+  it('fails after the probe timeout, naming the port, when the holder of the redirect port never answers', { timeout: 3000 }, async () => {
+    const blocker = await occupy();
+    const { port } = blocker.address();
+    await new Promise((resolve) => blocker.close(resolve));
+    const silent = () => Object.assign(new EventEmitter(), {
+      setTimeout(ms, onTimeout) {
+        this.timer = setTimeout(onTimeout, ms);
+      },
+      destroy() {
+        clearTimeout(this.timer);
+      },
+    });
+    const started = Date.now();
+    await assert.rejects(
+      waitForCode({ redirectUri: `https://localhost:${port}`, state: 's', cert: selfSignedCert(), timeoutMs: 1500, onListening: () => {}, log: () => {}, probe: { connect: silent, timeoutMs: 200 } }),
+      new RegExp(`port ${port} on localhost is already in use by another process`),
+    );
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 190 && elapsed < 1000, `took ${elapsed} ms`);
+  });
+
+  it('catches the code on a redirect URI with no path', async () => {
+    const blocker = await occupy();
+    const { port } = blocker.address();
+    await new Promise((resolve) => blocker.close(resolve));
+    const code = await waitForCode({
+      redirectUri: `https://localhost:${port}`,
+      state: 's',
+      cert: selfSignedCert(),
+      timeoutMs: 4000,
+      log: () => {},
+      onListening: () => get(`https://localhost:${port}/?code=c1&state=s`, { rejectUnauthorized: false }, (res) => res.resume()),
+    });
+    assert.equal(code, 'c1');
   });
 
   it('refuses an API base that is plain http on a host that is not loopback', () => {

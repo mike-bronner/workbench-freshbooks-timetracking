@@ -126,9 +126,11 @@ sentence.
 
 First ask for the redirect URI: "Which redirect URI should the FreshBooks app
 use?" Offer the current `freshbooks.redirect_uri` first when it is not the
-default, then "https://localhost:8080/callback (default)". Other takes another
+default, then "https://localhost:8443 (default)". Other takes another
 URI. It must use https, have the host `localhost` or `127.0.0.1`, and carry no
-query string, because the login listens for it on this machine. Save it:
+query string, because the login listens for it on this machine. Its port must
+be free: if another program on this machine already uses the port, the browser
+reaches that program instead of the login. Save it:
 
 ```bash
 bash "${CLAUDE_PLUGIN_ROOT}/bin/configure.sh" --redirect-uri '<uri>'
@@ -140,7 +142,10 @@ Then show Mike these steps, with the saved URI written out:
 
 1. Open https://my.freshbooks.com/#/developer and create an app, or open the
    one you made before.
-2. Set the redirect URI to `<the saved URI>`.
+2. Set the redirect URI to `<the saved URI>`, exactly as written. FreshBooks
+   accepts the login only when the app's URI matches the saved one exactly,
+   path included. `https://localhost:8443` and `https://localhost:8443/callback`
+   are different URIs.
 3. Turn on these six scopes:
    - `user:profile:read`
    - `user:projects:read`
@@ -199,6 +204,9 @@ Tell Mike what happens next, in a short list:
   website".
 - The script catches the code by itself and saves the login to the keychain.
   It waits up to 5 minutes.
+- The login must start here, from setup. Do not open the app's authorize link
+  in the FreshBooks developer page by hand. Nothing listens on the redirect URI
+  until `login.sh` runs, so that link goes nowhere.
 
 Ask: "Start the FreshBooks login now?" with the options "Start the login" and
 "Skip for now". On "Start the login", run this with a Bash timeout of 330000
@@ -221,7 +229,13 @@ When it fails:
   ask whether to run the login again.
 - If the error names missing scopes, tell Mike to add those scopes to the app
   in the developer page, and ask whether to run the login again.
+- If the error says the port is already in use by another process, show the
+  error. Go back to Step 5, ask for another redirect URI with a free port, and
+  tell Mike to set the same URI on the FreshBooks app. Then ask whether to run
+  the login again.
 - If no callback arrived within 5 minutes, ask whether to run the login again.
+  If the browser showed a FreshBooks error about the redirect URI, check that
+  the app's URI matches the saved one exactly, path included.
 
 ## Step 8: Confirm
 

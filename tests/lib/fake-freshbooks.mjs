@@ -11,7 +11,7 @@ const send = (res, status, body, headers = {}) => {
   res.writeHead(status, { 'Content-Type': 'application/json', ...headers }).end(body === undefined ? '' : JSON.stringify(body));
 };
 
-export async function fakeFreshbooks({ events = [], redirectUri = 'https://localhost:8080/callback' } = {}) {
+export async function fakeFreshbooks({ events = [], redirectUri = 'https://localhost:8443' } = {}) {
   const state = {
     redirectUri,
     code: 'auth-code-1',

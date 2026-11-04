@@ -18,8 +18,9 @@ for a set of lines that was approved.
   secret to the keychain through a hidden macOS dialog, and logs in. A rerun
   keeps the config and the repo mappings, and redoes only the steps you pick.
 - `/workbench-freshbooks-timetracking:estimate` asks for a date range and the
-  repos, maps each unmapped repo, shows the review table, and runs `push.sh`
-  only after you approve that table.
+  repos, maps each unmapped repo to an hourly and an optional flat-rate
+  service, shows the review table, lets you mark PRs as flat-rate, and runs
+  `push.sh` only after you approve that table.
 
 Both skills run the scripts below from the installed plugin. The scripts do
 every calculation and every FreshBooks call.
@@ -38,9 +39,10 @@ exists there. Set `WBFT_CONFIG` to use another path. The file holds no secrets.
 | `timezone` | system zone | IANA zone that decides the work day |
 | `authors` | required | GitHub logins whose PRs are billable; Apps as `slug[bot]` |
 | `freshbooks.client_id` | none | Client id of the FreshBooks app |
-| `freshbooks.redirect_uri` | `https://localhost:8080/callback` | Redirect URI registered on the app; HTTPS, no query string |
+| `freshbooks.redirect_uri` | `https://localhost:8443` | Redirect URI registered on the app; HTTPS, no query string |
 | `freshbooks.business_id`, `freshbooks.account_id` | set by login | Business the entries go to; set `business_id` with `configure.sh` first if the login has several |
-| `freshbooks.repos` | `{}` | Lower-case `owner/name` to `{client_id, project_id, service_id}`, saved by `map.sh` |
+| `freshbooks.repos` | `{}` | Lower-case `owner/name` to `{client_id, project_id, service_id}`, plus an optional `flat_rate_service_id`, saved by `map.sh`; `service_id` is the hourly service |
+| `freshbooks.flat_rate_prs` | `{}` | Lower-case `owner/name` to the PR numbers marked flat-rate, saved by `flat-rate.sh` |
 
 The client secret and the tokens live only in the macOS keychain, under the
 service `workbench-freshbooks-timetracking`. No script prints them, and none
@@ -69,9 +71,10 @@ bin/store-secret.sh [--dialog]         # hidden macOS dialog, hidden terminal pr
 bin/login.sh [--no-open]
 bin/range.sh
 bin/choices.sh
-bin/map.sh --repo owner/name --client <id> --project <id> --service <id>
+bin/map.sh --repo owner/name --client <id> --project <id> --service <id> [--flat-rate-service <id>]
 bin/unmapped.sh --repo owner/name [--repo ...]
 bin/estimate.sh --from ... --to ... --repo owner/name > lines.json
+bin/flat-rate.sh --lines lines.json [--mark owner/name#pr ...] [--clear owner/name#pr ...]
 bin/plan.sh --lines lines.json [--format table]
 bin/push.sh --lines lines.json --approve <code>
 ```
@@ -98,22 +101,36 @@ bin/push.sh --lines lines.json --approve <code>
   certificate, opens the approval page, and catches the code. The browser warns
   once about the certificate. A callback whose `state` does not match is
   rejected. The listener gives up after 5 minutes. The redirect host must be
-  `localhost` or `127.0.0.1`.
+  `localhost` or `127.0.0.1`. If another process already answers on the
+  redirect port, the login fails at once and names the port. The URI set on
+  the FreshBooks app must match the saved one exactly, path included.
 - A refresh token works once. Each refresh saves the new refresh token to the
   keychain before anything else, and a 401 triggers one refresh and one retry.
   A 429 backs off, honoring `Retry-After`.
 - `choices.sh` prints the active clients, the projects and the active services
   as `id`, `label` and `description` options. `map.sh` checks the ids against
-  FreshBooks before it saves them.
-- `plan.sh` turns each line into an entry: `is_logged` and `billable` true, a
-  duration of the billable hours in seconds, a `started_at` at the line's first
-  work on its local day, the mapped ids, and the label followed by the tag as
-  the note. It skips every line whose tag an existing entry's note carries, in
-  any case, and prints an approval code for the rest. Its table groups the
-  entries by repo in order of first work, marks git-sourced lines, and lists
-  the skipped lines.
+  FreshBooks before it saves them, and refuses a flat-rate service equal to
+  the hourly one.
+- `flat-rate.sh` lists the PRs of a lines file and whether a saved mark makes
+  each one flat-rate. `--mark` saves a mark for a PR in the file, and `--clear`
+  removes a saved mark. A mark covers every line of its PR, in every later
+  run, until it is cleared. Issue and general lines are always hourly.
+- `plan.sh` turns each line into an entry: `is_logged` true, a duration of the
+  billable hours in seconds, a `started_at` at the line's first work on its
+  local day, the mapped client and project, and the label followed by the tag
+  as the note. An hourly line is billable under the repo's `service_id`. A
+  flat-rate line is non-billable under its `flat_rate_service_id`. It skips
+  every line whose tag an existing entry's note carries, in any case, and
+  prints an approval code for the rest. The code covers each entry's billable
+  flag and service, so a changed mark needs a new review. When a repo has
+  flat-rate lines to create but no flat-rate service, the plan has no code and
+  says why. Its table groups the entries by repo in order of first work, shows
+  the rate of each line, marks git-sourced lines, splits billable from
+  non-billable hours, and lists the skipped lines.
 - `push.sh` builds the plan again and creates the entries only when the code
-  matches, so a changed line set or a new FreshBooks entry needs a new review.
+  matches, so a changed line set, a changed mark or a new FreshBooks entry
+  needs a new review. It creates nothing while a repo lacks a flat-rate
+  service it needs.
   It stops at the first error, and prints which entries were created, which
   failed and which were not attempted. It also stops when FreshBooks stores a
   note without its tag, because a rerun could not detect that entry.

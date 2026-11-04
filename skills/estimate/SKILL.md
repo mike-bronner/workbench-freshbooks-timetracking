@@ -1,6 +1,6 @@
 ---
 name: estimate
-description: Turn a date range of AI development work into FreshBooks time entries. Asks for the range and the repos, maps unmapped repos to a FreshBooks client, project and service, shows the review table, and creates the entries only after Mike approves that exact table.
+description: Turn a date range of AI development work into FreshBooks time entries. Asks for the range and the repos, maps unmapped repos to a FreshBooks client, project, hourly service and optional flat-rate service, shows the review table, lets Mike mark PRs as flat-rate, and creates the entries only after Mike approves that exact table.
 ---
 
 # Estimate and push FreshBooks time entries
@@ -18,7 +18,8 @@ only asks, shows and confirms.
   printed it.
 - Put every decision to Mike through AskUserQuestion. Never ask in prose.
 - Give every question 2 to 4 options. Steps 3 and 4 say how to ask a list of
-  one item, and how to split a longer list.
+  one item, and how to split a longer list. Step 7 uses the same rules for
+  PRs.
 - No step needs the client secret or a token. Never ask for one, show one or
   pass one.
 - Pass a value Mike typed to a script in single quotes. A date must look like
@@ -41,7 +42,8 @@ conditions:
 
 Never pick for Mike, never take approval from prose or from an earlier run,
 and never reuse a code. If anything changes after his pick, such as the range,
-the repos, a mapping or the lines file, that pick no longer counts. Run
+the repos, a mapping, a flat-rate mark or the lines file, that pick no longer
+counts. Run
 `plan.sh` again, show the new table and ask again.
 
 ## Step 1: Check the setup
@@ -136,7 +138,9 @@ Run `unmapped.sh` with every picked repo:
 bash "${CLAUDE_PLUGIN_ROOT}/bin/unmapped.sh" --repo '<owner/name>' --repo '<owner/name>'
 ```
 
-It prints `mapped` and `unmapped`. If `unmapped` is empty, go to step 5.
+It prints `mapped` and `unmapped`. Each mapped repo carries its `client_id`,
+`project_id`, `service_id` (the hourly service) and, when it has one, its
+`flat_rate_service_id`. If `unmapped` is empty, go to step 5.
 
 Otherwise run `bash "${CLAUDE_PLUGIN_ROOT}/bin/choices.sh"` once. It prints
 `clients`, `projects` and `services`, each with `id`, `label` and
@@ -146,30 +150,40 @@ Otherwise run `bash "${CLAUDE_PLUGIN_ROOT}/bin/choices.sh"` once. It prints
 Map the unmapped repos one at a time. For each repo:
 
 1. If you mapped a repo earlier in this run, first ask "Map `<repo>` the same
-   way as `<earlier repo>`?" The options are the earlier client, project and
-   service by label, and "Choose another client, project and service".
+   way as `<earlier repo>`?" The options are the earlier client, project,
+   hourly service and flat-rate service by label, and "Choose another client,
+   project and services".
 2. Ask for the client. Then ask for the project, offering only the projects
-   whose `client_id` is that client or empty. Then ask for the service,
-   offering the project's `service_ids` when it has any, and every service
-   when it has none. If the client has no project, tell Mike and ask him to
-   pick another client or to stop.
-3. Each of these is a single pick, with `multiSelect` false:
+   whose `client_id` is that client or empty. Then ask "Which service is for
+   hourly work on `<repo>`?", offering the project's `service_ids` when it has
+   any, and every service when it has none. If the client has no project, tell
+   Mike and ask him to pick another client or to stop.
+3. Ask "Does `<repo>` have a flat-rate service?" with the options "Yes" and
+   "No". The description of "Yes" says that PRs Mike marks as flat-rate are
+   logged there as non-billable entries. The description of "No" says that
+   every line is billed hourly until a flat-rate service is mapped. On "Yes",
+   ask "Which service is for flat-rate work on `<repo>`?", offering the same
+   services as for the hourly service, without the hourly one. If none is
+   left, tell Mike and go on with "No".
+4. Each pick of a client, project or service is a single pick, with
+   `multiSelect` false:
    - When the list holds one item, ask "Use `<item>`?" with the options "Yes"
      and "Choose another client". For the client itself, the second option is
-     "Stop".
+     "Stop". For the flat-rate service, it is "No flat-rate service".
    - When the list holds 2 to 4 items, offer them all in one question.
    - When the list holds more than 4 items, page it, one question per call.
      Each page holds 3 items and a fourth option "Show the next 3". The last
      page holds the 1 to 3 items left and the option "Back to the first page".
    - Other takes an id typed from the list.
-4. Save the mapping:
+5. Save the mapping. Add `--flat-rate-service` only when Mike picked one:
 
    ```bash
-   bash "${CLAUDE_PLUGIN_ROOT}/bin/map.sh" --repo '<owner/name>' --client '<id>' --project '<id>' --service '<id>'
+   bash "${CLAUDE_PLUGIN_ROOT}/bin/map.sh" --repo '<owner/name>' --client '<id>' --project '<id>' --service '<hourly id>' --flat-rate-service '<flat-rate id>'
    ```
 
-   `map.sh` checks the ids against FreshBooks. If it refuses them, show the
-   reason and ask again for that repo.
+   `map.sh` checks every id against FreshBooks, and refuses a flat-rate service
+   that equals the hourly one. If it refuses them, show the reason and ask
+   again for that repo.
 
 If Mike stops the mapping, ask whether to drop the unmapped repos from the
 selection or to stop. After the last mapping, run `unmapped.sh` again with the
@@ -186,24 +200,47 @@ bash "${CLAUDE_PLUGIN_ROOT}/bin/plan.sh" --lines '<lines file>' --format table
 ```
 
 The plan table has one section per repo, in order of first work, with a total
-per repo. Its Source column marks each line that comes from git commit times
-as "git (fallback)". A "To create" line gives the number of entries and their
-hours. A list shows the lines that FreshBooks already holds, which the push
-skips. The last line is the approval code.
+per repo. Each line shows:
+
+- Its Rate: "hourly", or "flat-rate (saved mark)" when Mike marked its PR as
+  flat-rate in this run or an earlier one. A flat-rate line is created as a
+  non-billable entry under the repo's flat-rate service.
+- Its Source: "git (fallback)" for a line that comes from git commit times.
+- Its Service id, or "none" for a flat-rate line in a repo that has no
+  flat-rate service.
+
+A "To create" line gives the number of entries, their hours, and how those
+hours split into billable hourly hours and non-billable flat-rate hours. A list
+shows the lines that FreshBooks already holds, which the push skips. The last
+line is the approval code. When a repo has flat-rate lines but no flat-rate
+service, the table instead ends with a "Cannot create" line per repo and "No
+approval code until every flat-rate line has a service."
 
 Copy the whole table into your reply, unchanged. If it says "Nothing new to
 create.", tell Mike that every line is already in FreshBooks, and stop.
 
 ## Step 6: Ask for approval
 
-Right after the table, ask: "Create these entries in FreshBooks?" Use the
-numbers from the "To create" line in the question. The options are:
+When the table ends with an approval code, ask right after the table: "Create
+these entries in FreshBooks?" Use the numbers from the "To create" line in the
+question. The options are:
 
 - "Create these entries": the description says it creates exactly the entries
   in the table above, under approval code `<code>`.
-- "Change the selection": go back to step 3 with the same range. The current
-  code no longer counts.
+- "Change flat-rate marks": go to step 7.
+- "Change the selection": go back to step 3 with the same range.
 - "Stop": create nothing.
+
+When the table has no approval code, ask right after the table: "How do you
+want to fix the flat-rate lines?" Name the repos of the "Cannot create" lines
+in the question. The options are:
+
+- "Map a flat-rate service": go to step 8.
+- "Change flat-rate marks": go to step 7.
+- "Change the selection": go back to step 3 with the same range.
+- "Stop": create nothing.
+
+Every pick but "Create these entries" voids the current code.
 
 Only on "Create these entries", run:
 
@@ -212,11 +249,88 @@ bash "${CLAUDE_PLUGIN_ROOT}/bin/push.sh" --lines '<lines file>' --approve '<code
 ```
 
 `push.sh` builds the plan again and creates nothing when the code does not
-match. If it exits with "the approval code does not match", FreshBooks or the
-lines changed since the table. Do not pass any other code. Run `plan.sh` again,
-show the new table and ask again in this step.
+match. If it exits with "the approval code does not match", FreshBooks, the
+lines or a flat-rate mark changed since the table. Do not pass any other code.
+Run `plan.sh` again, show the new table and ask again in this step. Then go to
+step 9.
 
-## Step 7: Report the result
+## Step 7: Change flat-rate marks
+
+A mark belongs to a PR, not to one day. It applies to every line of that PR,
+in this run and in every later run, until Mike clears it. Only PR lines can be
+flat-rate.
+
+Run:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/bin/flat-rate.sh" --lines '<lines file>'
+```
+
+It prints `pull_requests`, one per PR in the lines file, with `ref`
+(`owner/name#number`), `label`, `flat_rate` (true when a saved mark applies)
+and `description`. If the list is empty, tell Mike that no line in this range
+belongs to a PR. Then run `plan.sh` again as in step 5, show the table and ask
+again in step 6.
+
+Ask "Which flat-rate marks do you want to change?" with these options:
+
+- "Mark PRs as flat-rate": offer it only when a PR has `flat_rate` false. The
+  description names how many PRs are hourly.
+- "Clear flat-rate marks": offer it only when a PR has `flat_rate` true. The
+  description names how many PRs are marked.
+- "Back to the table": change nothing.
+
+For "Mark PRs as flat-rate", the list is the PRs with `flat_rate` false. For
+"Clear flat-rate marks", it is the PRs with `flat_rate` true. Ask that list in
+the printed order, through the two forms of step 3:
+
+- One PR: ask "Mark `<ref>` as flat-rate?" or "Clear the flat-rate mark of
+  `<ref>`?" with the options "Yes" and "No".
+- Two or more PRs: ask them in batches, with `multiSelect` true, under the
+  batch rules of step 3. Head each question with its place, such as "PRs 1 to
+  4 of 9". Each option has the `ref` as label, and the `label` and
+  `description` from the script as description. Other with "none" skips the
+  batch. Other may also name a PR as `owner/name#number`. Keep a typed PR only
+  when it is in the list you asked, and tell Mike which typed PRs you dropped.
+
+Then save all picks in one run, with one `--mark` or `--clear` per picked PR:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/bin/flat-rate.sh" --lines '<lines file>' --mark '<owner/name#number>' --mark '<owner/name#number>'
+bash "${CLAUDE_PLUGIN_ROOT}/bin/flat-rate.sh" --lines '<lines file>' --clear '<owner/name#number>'
+```
+
+If Mike picked nothing, save nothing. If the script refuses a PR, show its
+reason. It saves nothing in that case, so ask the list again.
+
+On "Back to the table" and after a save, run `plan.sh` with `--format table`
+again, as in step 5. Show the new table and ask again in step 6. The earlier
+approval code no longer counts.
+
+## Step 8: Map a flat-rate service
+
+For each repo named in a "Cannot create" line, run `unmapped.sh` with that
+repo. It prints the repo under `mapped`, with its `client_id`, `project_id`
+and `service_id`. Run `bash "${CLAUDE_PLUGIN_ROOT}/bin/choices.sh"` once.
+
+Ask "Which service is for flat-rate work on `<repo>`?", with the single-pick
+rules of step 4. Offer the services of the mapped project without the hourly
+`service_id`, or every service but the hourly one when the project lists no
+services. If no service is left, tell Mike, and go back to step 6 with the
+same table.
+
+Save the mapping with the repo's own client, project and hourly service, and
+the picked flat-rate service:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/bin/map.sh" --repo '<owner/name>' --client '<client_id>' --project '<project_id>' --service '<service_id>' --flat-rate-service '<flat-rate id>'
+```
+
+If `map.sh` refuses it, show the reason and ask again for that repo. After the
+last repo, run `plan.sh` with `--format table` again, as in step 5. Show the
+new table and ask again in step 6.
+
+## Step 9: Report the result
 
 `push.sh` prints JSON with `created`, `skipped`, `failed` and `not_attempted`.
 It prints the same JSON when it stops at an error.

@@ -11,7 +11,7 @@
   ],
   "freshbooks": {
     "client_id": null,
-    "redirect_uri": "https://localhost:8080/callback",
+    "redirect_uri": "https://localhost:8443",
     "repos": {}
   }
 }
