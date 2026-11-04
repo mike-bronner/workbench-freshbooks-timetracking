@@ -19,7 +19,7 @@ for a set of lines that was approved.
   keeps the config and the repo mappings, and redoes only the steps you pick.
 - `/workbench-freshbooks-timetracking:estimate` asks for a date range and the
   repos, maps each unmapped repo to an hourly and an optional flat-rate
-  service, shows the review table, lets you mark PRs, issues and general days
+  service, shows the review table, lets you mark PRs, issues and branch days
   as flat-rate, and runs `push.sh` only after you approve that table.
 
 Both skills run the scripts below from the installed plugin. The scripts do
@@ -30,6 +30,9 @@ every calculation and every FreshBooks call.
 The setup skill, or `bin/init-config.sh`, copies `assets/config.example.json`
 to `~/.config/workbench-freshbooks-timetracking/config.json` when no config
 exists there. Set `WBFT_CONFIG` to use another path. The file holds no secrets.
+`plan.sh` and `push.sh` keep `ledger.json` in the same folder. It maps the
+internal key of each line to the ids of its FreshBooks entries, and holds no
+secrets either.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -44,7 +47,7 @@ exists there. Set `WBFT_CONFIG` to use another path. The file holds no secrets.
 | `freshbooks.repos` | `{}` | Lower-case `owner/name` to `{client_id, project_id, service_id}`, plus an optional `flat_rate_service_id`, saved by `map.sh`; `service_id` is the hourly service |
 | `freshbooks.flat_rate_prs` | `{}` | Lower-case `owner/name` to the PR numbers marked flat-rate, saved by `flat-rate.sh` |
 | `freshbooks.flat_rate_issues` | `{}` | Lower-case `owner/name` to the issue numbers marked flat-rate, saved by `flat-rate.sh` |
-| `freshbooks.flat_rate_days` | `{}` | Lower-case `owner/name` to the `YYYY-MM-DD` days whose general line is flat-rate, saved by `flat-rate.sh` |
+| `freshbooks.flat_rate_days` | `{}` | Lower-case `owner/name` to the `YYYY-MM-DD` days whose branch line is flat-rate, saved by `flat-rate.sh`. A mark saved for a former general line keeps that entry flat-rate after it is relabelled |
 
 The client secret and the tokens live only in the macOS keychain, under the
 service `workbench-freshbooks-timetracking`. No script prints them, and none
@@ -94,8 +97,8 @@ bin/push.sh --lines lines.json --approve <code>
 - `store-secret.sh --dialog` takes the secret from a macOS dialog with a hidden
   field and pipes it to the keychain. A cancelled dialog saves nothing.
 - `range.sh` reads the FreshBooks entries of the last 366 days and prints
-  date-range choices: since the latest day a tag names, this month so far, and
-  last month.
+  date-range choices: since the latest day of an entry the ledger records (or
+  that an older note tags), this month so far, and last month.
 - The app needs the scopes `user:profile:read`, `user:projects:read`,
   `user:clients:read`, `user:billable_items:read`, `user:time_entries:read` and
   `user:time_entries:write`.
@@ -113,48 +116,82 @@ bin/push.sh --lines lines.json --approve <code>
   as `id`, `label` and `description` options. `map.sh` checks the ids against
   FreshBooks before it saves them, and refuses a flat-rate service equal to
   the hourly one.
-- `flat-rate.sh` lists the PRs, issues and general days of a lines file, and
+- `flat-rate.sh` lists the PRs, issues and branch days of a lines file, and
   whether a saved mark makes each one flat-rate. `--mark` saves a mark for an
   item in the file, and `--clear` removes a saved mark. An item is
   `owner/name#number` for a PR or an issue, and `owner/name:YYYY-MM-DD` for
-  the general line of one repo on one day. A PR mark covers every line of its
+  the branch line of one repo on one day. A PR mark covers every line of its
   PR, and an issue mark every issue line of its issue. A mark holds in every
   later run, until it is cleared.
 - `plan.sh` turns each line into an entry: `is_logged` true, a duration of the
   billable hours in seconds, a `started_at` at the line's first work on its
-  local day, the mapped client and project, and the label followed by the tag
-  as the note. Every entry is billable. An hourly line goes under the repo's
+  local day, the mapped client and project, and the label as the note. A note
+  never holds an internal key. Every entry is billable. An hourly line goes under the repo's
   `service_id`, and a flat-rate line under its `flat_rate_service_id`, so a
   $0 flat-rate service shows the line on the invoice at $0.
-- `plan.sh` compares each entry whose note carries a line's tag, in any case,
-  with what it would create for that line. When the billable flag or the
-  service differs, it lists the entry to update, with the old and new values.
-  An update never touches the duration, the date or the note, and never an
-  entry without a tag. Every other tagged entry is skipped. The plan prints
+- `plan.sh` finds the entries of each line in this order:
+  1. The ids the ledger records for the line's key.
+  2. An entry whose note still carries the line's key as an older
+     `[wbi:<key>]` tag, in any case.
+  3. When the ledger has no record for the key: an entry on the same local
+     day, in the same project, whose note equals the line's note. The compare
+     ignores emoji and runs of spaces, because FreshBooks strips some emoji.
+     It never takes an entry that the ledger records for another key, or that
+     carries a tag.
+  4. For a line that took over the time of a former general line, the entry
+     of that general line, by its ledger record or its tag.
+- A line with no entry is created. A line that shares the time of a former
+  general line with a larger line, and has no entry of its own, is skipped
+  when that entry already bills it. It is also skipped, and named in the
+  table, when the ledger does not know that entry but an unrecorded entry on
+  the same day and project carries the larger line's note, because that
+  entry may bill it.
+- An entry matched by its note alone is skipped and shown as "matched by note
+  only". The plan never changes its billable flag or service on that guess.
+- The ledger records the matches by ledger or tag while the plan has no
+  "Cannot" line, and each new entry as soon as FreshBooks returns its id. A
+  match by note alone is a guess, and never reaches the ledger, before or
+  after a push.
+- For each matched entry the plan compares the billable flag, the service and
+  the note with what it would create. A note changes only when it carries an
+  older tag: it becomes the line's label, which drops the tag and relabels a
+  former general entry with the PR or issue its time belongs to. A note
+  without a tag stays as it is, so an edit made in FreshBooks survives. An
+  entry matched through a former general line keeps the rate of its day:
+  flat-rate when the day carries a flat-rate mark, hourly otherwise, whatever
+  the rate of the line that took over its time. A tagged entry in the range and repos of the
+  lines that no line matches loses its tag, and keeps everything else.
+  An update never touches the duration or the date, and never an entry that
+  is neither in the ledger nor tagged. The plan prints
   one approval code that covers each new entry and each update, so a changed
   mark or a changed FreshBooks entry needs a new review.
 - The plan has no code, and says why, in any of these cases:
   - A repo has flat-rate lines, new or already in FreshBooks, but no
     flat-rate service.
   - The FreshBooks list leaves out `billable`, `service_id`, `duration` or
-    `started_at` for a tagged entry, so the plan cannot compare it.
+    `started_at` for a matched entry, so the plan cannot compare it.
   - The FreshBooks list leaves out `is_logged`, `client_id` or `project_id`
     for an entry to update, so the plan cannot send the full entry.
   - The listed `is_logged` of an entry to update is not true or false, or its
     `started_at` or `duration` is not a valid value.
   - An update has no valid entry id.
-  - One entry carries the tags of more than one line.
+  - One entry matches more than one line.
+  - The ledger records an entry that FreshBooks does not list for that window.
+  - An entry still carries the tag of a general line that no line of the
+    estimate can relabel.
 - The plan table groups the new entries by repo in order of first work, shows
   the rate of each line, marks git-sourced lines, and splits hourly from
   flat-rate hours. A separate section lists the updates with the client and
-  project of each entry, and a list names the unchanged entries.
+  project of each entry, and how the plan matched it (ledger or older tag), and a list names the unchanged entries.
 - `push.sh` builds the plan again, and creates and updates entries only when
   the code matches, so a changed line set, a changed mark or a changed
   FreshBooks entry needs a new review. It changes nothing while the plan has
   no code. It creates the new entries first, then sends each update as a PUT
   of the full entry as the list returned it (`is_logged`, `started_at`,
   `duration`, `note`, `client_id`, `project_id`, `service_id` and
-  `billable`), with only the billable flag or the service changed. FreshBooks
+  `billable`), with only the billable flag, the service or the note changed.
+  It refuses an update of an entry the plan did not match, and any note that
+  holds an internal key. FreshBooks
   refuses a PUT that leaves out `started_at` or `is_logged`, and a field left
   out could be reset. The approval code covers every value of that body. It
   stops when the PUT response does not show the new values, or shows any
@@ -162,8 +199,7 @@ bin/push.sh --lines lines.json --approve <code>
   It stops at the first error, and prints which entries were created, which
   were updated, which were skipped, which failed and which were not attempted.
   A failed update says whether the entry may have changed. It also stops when
-  FreshBooks stores a note without its tag, because a rerun could not detect
-  that entry.
+  the ledger cannot record a new entry, and reports that entry as created.
 
 ## How hours are counted
 
@@ -185,14 +221,27 @@ bin/push.sh --lines lines.json --approve <code>
 3. Otherwise the first PR or issue the agent's prompts name (or its parent
    session's prompts) is used, if GitHub shows it updated in the range. An
    issue that a PR in the same repo closes goes to that PR.
-4. Anything else is one general line per repo per day.
-5. A billable PR with no session time gets git-sourced lines from its commit
-   times: the same gap rule, plus one idle gap of lead-in before each burst.
+4. Time that is still unmatched goes to the PR that holds a commit by one of
+   the `authors`, made during that run of work or within one idle gap after
+   it. `estimate.sh` searches GitHub for the PRs of that repo updated in the
+   range, with their commit authors, and warns when it read only the first
+   100 commits of a PR. When several PRs hold such commits, the time splits by
+   their number of commits.
+5. Failing that, it goes to the PR with the most time in that repo on that
+   day, then to the PR of the nearest day in the range.
+6. Only a repo with no PR in the range keeps its own line per day, labelled
+   with its branches, such as "Work on branch main".
+7. A billable PR with no session time from steps 2 to 4 gets git-sourced
+   lines from its commit times: the same gap rule, plus one idle gap of
+   lead-in before each burst.
 
-Each line carries a tag for later deduplication:
-`[wbi:owner/repo#<PR or issue>:<date>]`, or `[wbi:owner/repo:<date>]` for a
-general line. The repo in a tag is always lower case, so the tag does not
-depend on how a remote spells it.
+Each line carries an internal key: `owner/repo#<PR or issue>:<date>`, or
+`owner/repo:<date>` for a branch line. The repo in a key is always lower case,
+so the key does not depend on how a remote spells it. The key stays out of
+FreshBooks: the ledger maps it to entry ids. A line that took over time from
+steps 4 and 5 carries `former`: `primary` for the line with the largest share
+of that repo's day, which inherits the entry of the former general line, and
+`shared` for the others.
 
 ## Development
 

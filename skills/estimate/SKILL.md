@@ -1,6 +1,6 @@
 ---
 name: estimate
-description: Turn a date range of AI development work into FreshBooks time entries. Asks for the range and the repos, maps unmapped repos to a FreshBooks client, project, hourly service and optional flat-rate service, shows the review table, lets Mike mark PRs, issues and general days as flat-rate, and creates new entries and corrects existing ones only after Mike approves that exact table.
+description: Turn a date range of AI development work into FreshBooks time entries. Asks for the range and the repos, maps unmapped repos to a FreshBooks client, project, hourly service and optional flat-rate service, shows the review table, lets Mike mark PRs, issues and branch days as flat-rate, and creates new entries and corrects existing ones, including relabelling older tagged notes, only after Mike approves that exact table.
 ---
 
 # Estimate and push FreshBooks time entries
@@ -200,28 +200,45 @@ bash "${CLAUDE_PLUGIN_ROOT}/bin/estimate.sh" --from '<from>' --to '<to>' --repo 
 bash "${CLAUDE_PLUGIN_ROOT}/bin/plan.sh" --lines '<lines file>' --format table
 ```
 
+If the `warnings` list in the lines file is not empty, mention each warning
+in one sentence before the table.
+
 The plan table has one section per repo with the entries to create, in order
 of first work, with a total per repo. Each line shows:
 
+- Its Note: the label alone. No note holds an internal key.
 - Its Rate: "hourly", or "flat-rate (saved mark)" when Mike marked its PR,
-  issue or general day as flat-rate in this run or an earlier one. Every
+  issue or branch day as flat-rate in this run or an earlier one. Every
   entry is billable. A flat-rate line goes under the repo's flat-rate service,
   so its price comes from that service's rate.
 - Its Source: "git (fallback)" for a line that comes from git commit times.
 - Its Service id, or "none" for a flat-rate line in a repo that has no
   flat-rate service.
 
-A section "Existing entries to update" follows when FreshBooks holds tagged
-entries whose billable flag or service differs from what the plan would create
-now. Each row shows the entry id, its client and project, and, for both fields,
-the old and new value or "unchanged". An update changes only those two fields,
-never the duration, the date or the note. It sends every other field back as
+A section "Existing entries to update" follows when FreshBooks holds entries
+of this plugin whose billable flag, service or note differs from what the plan
+would create now. The plan knows these entries from the ledger beside the
+config, from an older `[wbi:…]` tag in the note, or from a note equal to the
+line's label on the same day and project. A note changes only when it still
+carries an older tag: the Note cell then shows the old note, an arrow and the
+new label. That drops the tag, and relabels a former "General development"
+entry with the PR or issue its time now belongs to. Each row also shows the
+entry id, how the plan matched it ("ledger" or "older tag"), its client and
+project, and, for the billable flag and the service,
+the old and new value or "unchanged". An update never changes the duration or
+the date, and never deletes an entry. It sends every other field back as
 FreshBooks holds it.
 
 A "To create" line gives the number of new entries, their hours, and how those
 hours split into hourly and flat-rate hours. A "To update" line gives the
-number of existing entries to change. A list shows the entries that FreshBooks
-already holds unchanged, which the push skips. The last line is the approval
+number of existing entries to change, and how many note, billable and service
+changes they hold. A list shows the entries that FreshBooks already holds
+unchanged, which the push skips. A line "billed in former general entry"
+names a share of a former general entry that another line's entry already
+bills. A line "may be billed in entry …, which the ledger does not record; not
+created" names a share the plan did not create because an unrecorded entry
+may bill it. Mention it to Mike in one sentence. An entry "matched by note
+only" is skipped, and its rate stays as FreshBooks holds it. The last line is the approval
 code. When the plan cannot go ahead, the table instead ends with one "Cannot
 create" or "Cannot update" line per problem, and "No approval code until every
 "Cannot" line above is fixed."
@@ -273,7 +290,9 @@ mark has one of three kinds:
 
 - A PR mark covers every line of that PR.
 - An issue mark covers every issue line of that issue.
-- A general mark covers the general line of one repo on one day.
+- A branch-day mark covers the branch line of one repo on one day. A mark
+  saved earlier for a former general line keeps that entry flat-rate after it
+  is relabelled.
 
 Run:
 
@@ -281,12 +300,12 @@ Run:
 bash "${CLAUDE_PLUGIN_ROOT}/bin/flat-rate.sh" --lines '<lines file>'
 ```
 
-It prints `items`, one per PR, issue and general day in the lines file. Each
+It prints `items`, one per PR, issue and branch day in the lines file. Each
 item has these fields:
 
 - `ref`: `owner/name#number` for a PR or an issue, and `owner/name:YYYY-MM-DD`
-  for a general day.
-- `kind`: `pr`, `issue` or `general`.
+  for a branch day.
+- `kind`: `pr`, `issue` or `general` (a branch day).
 - `label`, and `flat_rate`, which is true when a saved mark applies.
 - `description`.
 
@@ -360,17 +379,18 @@ Lead with the outcome in one sentence: how many entries were created and
 updated, and whether the push finished. Then:
 
 - Name the skipped lines when there are any.
-- When `failed` is set, name its tag and error. Its `action` is `create` or
+- When `failed` is set, name its key and error. Its `action` is `create` or
   `update`.
 - For `create`, its `created` field says whether that entry exists:
   - `no`: FreshBooks refused it, and a rerun of this skill tries it again.
   - `unknown`: Mike checks FreshBooks for that entry before a rerun.
-  - `yes`: the entry exists but its note lost the tag. Mike fixes the note in
-    FreshBooks before a rerun, or the rerun creates it twice.
+  - `yes`: the entry exists, but the ledger beside the config could not
+    record it. Mike makes that file writable before a rerun. A rerun still
+    finds the entry by its note, unless the note was edited in FreshBooks.
 - For `update`, its `changed` field says whether entry `id` may have changed:
   - `no`: FreshBooks refused the change, and a rerun tries it again.
   - `unknown`: the entry may have changed. A rerun lists it under "Existing
     entries to update" again only if it still differs.
-- List the `not_attempted` tags, and say that a rerun of this skill picks them
+- List the `not_attempted` keys, and say that a rerun of this skill picks them
   up, because the plan skips every entry that FreshBooks already holds as
   planned.

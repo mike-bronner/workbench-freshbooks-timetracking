@@ -59,7 +59,13 @@ export const pr = ({ repo = 'acme/widgets', number = 1, commits = [], linkedIssu
   ...fields,
   closingIssuesReferences: { nodes: linkedIssue ? [{ repository: { nameWithOwner: repo }, ...linkedIssue }] : [] },
   repository: { nameWithOwner: repo },
-  commits: { totalCount: commits.length, nodes: commits.map((t) => ({ commit: { authoredDate: at(t) } })) },
+  commits: {
+    totalCount: commits.length,
+    nodes: commits.map((c) => {
+      const { t, login = 'mikebronner', email = null } = typeof c === 'string' ? { t: c } : c;
+      return { commit: { authoredDate: at(t), author: { email, user: login ? { login } : null } } };
+    }),
+  },
 });
 
 export const issue = (number, title, updatedAt = '2026-10-20T00:00:00Z') => ({
@@ -73,7 +79,9 @@ export function fakeGh({ prs = [], refs = {} }) {
     if (query.includes('search(')) {
       const updated = /updated:>=(\S+)/.exec(variables.q)[1];
       const created = /created:<=(\S+)/.exec(variables.q)[1];
-      const hits = prs.filter((p) => p.updatedAt.slice(0, 10) >= updated && p.createdAt.slice(0, 10) <= created);
+      const repo = /repo:(\S+)/.exec(variables.q)?.[1];
+      const hits = prs.filter((p) => p.updatedAt.slice(0, 10) >= updated && p.createdAt.slice(0, 10) <= created)
+        .filter((p) => !repo || p.repository.nameWithOwner === repo);
       return { data: { search: { issueCount: hits.length, pageInfo: { hasNextPage: false, endCursor: null }, nodes: hits } } };
     }
     const repo = `${variables.owner}/${variables.name}`;

@@ -27,7 +27,6 @@ export async function fakeFreshbooks({ events = [], redirectUri = 'https://local
     entries: [],
     nextId: 1000,
     failures: [],
-    mangleNotes: false,
     omitPages: false,
     log: [],
   };
@@ -86,7 +85,6 @@ export async function fakeFreshbooks({ events = [], redirectUri = 'https://local
     }],
     ['POST', /^\/timetracking\/business\/77\/time_entries$/, (url, body) => {
       const entry = { ...body.time_entry, id: state.nextId++ };
-      if (state.mangleNotes) entry.note = entry.note.replace(/[[\]]/g, '');
       state.entries.push(entry);
       return [200, { time_entry: entry }];
     }],

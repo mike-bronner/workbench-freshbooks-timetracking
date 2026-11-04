@@ -5,13 +5,13 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { lookupRefs, runGh, searchPullRequests, searchQualifier } from '../lib/collect/github.mjs';
+import { commitLogin, lookupRefs, runGh, searchPullRequests, searchQualifier, searchRepoPullRequests } from '../lib/collect/github.mjs';
 import { createResolver, parseGithubRemote } from '../lib/collect/resolve.mjs';
 import { readTranscript } from '../lib/collect/sessions.mjs';
 import { loadConfig, normalizeConfig } from '../lib/config.mjs';
-import { billableHours, buildRange, estimate, extractRefs, tagFor } from '../lib/estimate.mjs';
+import { billableHours, buildRange, estimate, extractRefs, keyFor } from '../lib/estimate.mjs';
 import { isDate, splitAtMidnight, zonedMidnight } from '../lib/time.mjs';
-import { at, config, issue, pr, sandbox } from './lib/fixtures.mjs';
+import { at, config, fakeGh, issue, pr, sandbox } from './lib/fixtures.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
@@ -90,10 +90,10 @@ describe('hours', () => {
     assert.equal(billableHours(60 * 60000, config({ human_minutes_per_ai_hour: 60, rounding_step_hours: 0.1 })), 1);
   });
 
-  it('tags PR, issue and general lines in stable forms', () => {
-    assert.equal(tagFor({ repo: 'o/r', date: '2026-10-14', kind: 'pr', pr: 123, issue: 7 }), '[wbi:o/r#123:2026-10-14]');
-    assert.equal(tagFor({ repo: 'o/r', date: '2026-10-14', kind: 'issue', pr: null, issue: 7 }), '[wbi:o/r#7:2026-10-14]');
-    assert.equal(tagFor({ repo: 'o/r', date: '2026-10-14', kind: 'general', pr: null, issue: null }), '[wbi:o/r:2026-10-14]');
+  it('keys PR, issue and branch lines in stable forms', () => {
+    assert.equal(keyFor({ repo: 'o/r', date: '2026-10-14', kind: 'pr', pr: 123, issue: 7 }), 'o/r#123:2026-10-14');
+    assert.equal(keyFor({ repo: 'o/r', date: '2026-10-14', kind: 'issue', pr: null, issue: 7 }), 'o/r#7:2026-10-14');
+    assert.equal(keyFor({ repo: 'o/r', date: '2026-10-14', kind: 'general', pr: null, issue: null }), 'o/r:2026-10-14');
   });
 });
 
@@ -310,9 +310,9 @@ describe('resolution guards', () => {
     }
   });
 
-  it('writes tags in one case whatever the remote spelling', () => {
-    assert.equal(tagFor({ repo: 'CrossBibleInc/CrossBible', date: '2026-10-14', kind: 'general' }), '[wbi:crossbibleinc/crossbible:2026-10-14]');
-    assert.equal(tagFor({ repo: 'Acme/Widgets', date: '2026-10-14', kind: 'pr', pr: 5 }), '[wbi:acme/widgets#5:2026-10-14]');
+  it('writes keys in one case whatever the remote spelling', () => {
+    assert.equal(keyFor({ repo: 'CrossBibleInc/CrossBible', date: '2026-10-14', kind: 'general' }), 'crossbibleinc/crossbible:2026-10-14');
+    assert.equal(keyFor({ repo: 'Acme/Widgets', date: '2026-10-14', kind: 'pr', pr: 5 }), 'acme/widgets#5:2026-10-14');
   });
 });
 
@@ -337,5 +337,124 @@ describe('context of a gap', () => {
   it('gives a gap to the repo of its earlier message', () => {
     const points = [point('10:00:00', '/r1', 'b1'), point('10:05:00', '/r1', 'b1'), point('10:10:00', '/r2', 'b2'), point('10:20:00', '/r2', 'b2')];
     assert.deepEqual(run(points, [prOn('acme/one', 1, 'b1'), prOn('acme/two', 2, 'b2')]), [['acme/one', 1, 600], ['acme/two', 2, 600]]);
+  });
+});
+
+describe('attribution of session time that matches no PR', () => {
+  const c = config({ authors: ['mikebronner', 'dr-john-h-watson[bot]'] });
+  const range = buildRange('2026-10-01', '2026-10-31', c.timezone);
+  const ms = (local) => Date.parse(at(local));
+  const agent = (id, times, branch = 'main', cwd = '/r1') => ({ key: id, sessionId: id, agentId: 'main', prompts: [], points: times.map((t) => ({ t: ms(t), cwd, branch })) });
+  const prOn = (number, branch, authored = [], repo = 'acme/one') => ({
+    repo, number, title: `PR ${number}`, url: null, headRefName: branch, linkedIssue: null, createdAt: 0, closedAt: null, updatedAt: 0,
+    commits: authored.map((a) => a.t), commitCount: authored.length, authored,
+  });
+  const commit = (local, login = 'mikebronner') => ({ t: ms(local), login });
+  const run = (agents, prs, found = prs) => {
+    const asked = [];
+    const result = estimate({
+      agents, prs, config: c, range, lookupRefs: () => new Map(),
+      resolveRepo: (cwd) => ({ '/r1': 'acme/one', '/r2': 'acme/two' })[cwd],
+      lookupCommits: (repos) => {
+        asked.push(repos);
+        return found;
+      },
+    });
+    return { asked, lines: result.repos.flatMap((r) => r.lines.map((l) => [l.date, l.kind, l.pr, l.active_seconds, l.former, l.label])) };
+  };
+  const work = (date) => agent(`w-${date}`, [`${date} 10:00:00`, `${date} 10:10:00`]);
+  const owned = (date) => agent(`o-${date}`, [`${date} 08:00:00`, `${date} 08:10:00`], 'b1');
+
+  it('gives the time to the PR that holds a billable commit made during it, before the PR of that day', () => {
+    const { asked, lines } = run([owned('2026-10-14'), work('2026-10-14')], [prOn(1, 'b1')], [prOn(2, 'b2', [commit('2026-10-14 10:20:00')])]);
+    assert.deepEqual(asked, [['acme/one']]);
+    assert.deepEqual(lines, [
+      ['2026-10-14', 'pr', 1, 600, null, 'PR #1: PR 1'],
+      ['2026-10-14', 'pr', 2, 600, 'primary', 'PR #2: PR 2'],
+    ]);
+  });
+
+  it('counts a commit up to one idle gap after the work, but not a moment later, and not by another author', () => {
+    const with2 = (authored) => run([owned('2026-10-14'), work('2026-10-14')], [prOn(1, 'b1')], [prOn(2, 'b2', [authored])]).lines.map((l) => [l[2], l[3]]);
+    assert.deepEqual(with2(commit('2026-10-14 10:25:00')), [[1, 600], [2, 600]]);
+    assert.deepEqual(with2(commit('2026-10-14 10:00:00')), [[1, 600], [2, 600]]);
+    assert.deepEqual(with2(commit('2026-10-14 10:25:01')), [[1, 1200]]);
+    assert.deepEqual(with2(commit('2026-10-14 09:59:59')), [[1, 1200]]);
+    assert.deepEqual(with2(commit('2026-10-14 10:05:00', 'someone')), [[1, 1200]]);
+    assert.deepEqual(with2(commit('2026-10-14 10:05:00', 'Dr-John-H-Watson[bot]')), [[1, 600], [2, 600]]);
+  });
+
+  it('gives a PR that takes session time through its commits no git-fallback time for the same work', () => {
+    const two = prOn(2, 'b2', [commit('2026-10-14 10:20:00')]);
+    const { lines } = run([work('2026-10-14')], [two], [two]);
+    assert.deepEqual(lines.map((l) => [l[2], l[3]]), [[2, 600]]);
+  });
+
+  it('warns when the lookup read only part of the commits of a PR', () => {
+    const big = { ...prOn(2, 'b2', [commit('2026-10-14 10:05:00')]), commitCount: 150 };
+    const result = estimate({
+      agents: [work('2026-10-14')], prs: [], config: c, range, lookupRefs: () => new Map(), resolveRepo: () => 'acme/one', lookupCommits: () => [big],
+    });
+    assert.deepEqual(result.warnings, ['acme/one#2: only the first 1 of 150 commits were read when looking up who made unmatched work']);
+  });
+
+  it('reads one run of work as a whole, so a commit after its last message covers its first', () => {
+    const run3 = agent('w3', ['2026-10-14 10:00:00', '2026-10-14 10:10:00', '2026-10-14 10:20:00']);
+    const { lines } = run([owned('2026-10-14'), run3], [prOn(1, 'b1')], [prOn(2, 'b2', [commit('2026-10-14 10:30:00')])]);
+    assert.deepEqual(lines.map((l) => [l[2], l[3]]), [[1, 600], [2, 1200]]);
+  });
+
+  it('splits the time by commit share when several PRs hold commits made during it', () => {
+    const found = [prOn(2, 'b2', [commit('2026-10-14 10:01:00')]), prOn(3, 'b3', [commit('2026-10-14 10:02:00', 'dr-john-h-watson[bot]'), commit('2026-10-14 10:03:00'), commit('2026-10-14 10:04:00')])];
+    const { lines } = run([work('2026-10-14')], [], found);
+    assert.deepEqual(lines.map((l) => [l[2], l[3], l[4]]), [[2, 150, 'shared'], [3, 450, 'primary']]);
+  });
+
+  it('falls back to the PR of that day when GitHub finds no commit', () => {
+    const { lines } = run([owned('2026-10-13'), owned('2026-10-14'), work('2026-10-14')], [prOn(1, 'b1'), prOn(9, 'b9', [commit('2026-10-15 12:00:00')])], []);
+    assert.deepEqual(lines.filter((l) => l[0] === '2026-10-14').map((l) => [l[2], l[3], l[4]]), [[1, 1200, 'primary']]);
+  });
+
+  it('falls back to the nearest PR in the range when no PR has work that day, the busier one on a tie', () => {
+    const prs = [prOn(1, 'b1'), prOn(4, 'b4', [commit('2026-10-18 09:00:00')])];
+    const { lines } = run([owned('2026-10-11'), work('2026-10-14'), work('2026-10-20')], prs, []);
+    const of = (date) => lines.filter((l) => l[0] === date).map((l) => [l[2], l[4]]);
+    assert.deepEqual(of('2026-10-14'), [[1, 'primary']]);
+    assert.deepEqual(of('2026-10-20'), [[4, 'primary']]);
+    const tie = run([owned('2026-10-12'), agent('o2', ['2026-10-16 08:00:00', '2026-10-16 08:14:00'], 'b4'), work('2026-10-14')], [prOn(1, 'b1'), prOn(4, 'b4')], []).lines;
+    assert.deepEqual(tie.filter((l) => l[0] === '2026-10-14').map((l) => l[2]), [4]);
+  });
+
+  it('keeps a branch line only in a repo with no PR in the range, labelled with its branches', () => {
+    const { lines } = run([work('2026-10-14'), agent('x', ['2026-10-14 12:00:00', '2026-10-14 12:05:00'], 'feature/x'), agent('n', ['2026-10-15 12:00:00', '2026-10-15 12:05:00'], null)], [prOn(1, 'b1', [], 'acme/two')], []);
+    assert.deepEqual(lines, [
+      ['2026-10-14', 'general', null, 900, null, 'Work on branches feature/x, main'],
+      ['2026-10-15', 'general', null, 300, null, 'Work on acme/one'],
+    ]);
+    const one = run([work('2026-10-14')], [], []).lines;
+    assert.deepEqual(one.map((l) => l[5]), ['Work on branch main']);
+  });
+
+  it('asks GitHub only when time is left unmatched, and only for those repos', () => {
+    assert.deepEqual(run([owned('2026-10-14')], [prOn(1, 'b1')]).asked, []);
+    assert.deepEqual(run([owned('2026-10-14'), agent('w2', ['2026-10-14 10:00:00', '2026-10-14 10:10:00'], 'main', '/r2')], [prOn(1, 'b1')], []).asked, [['acme/two']]);
+  });
+
+  it('reads a commit login from the user, or from a GitHub noreply address of a bot', () => {
+    assert.equal(commitLogin({ user: { login: 'mikebronner' }, email: 'x@y.z' }), 'mikebronner');
+    assert.equal(commitLogin({ user: null, email: '1234+dr-john-h-watson[bot]@users.noreply.github.com' }), 'dr-john-h-watson[bot]');
+    assert.equal(commitLogin({ user: null, email: 'mike@genealabs.com' }), null);
+    assert.equal(commitLogin(null), null);
+  });
+
+  it('searches the PRs of each repo, with the commit authors', () => {
+    const gh = fakeGh({ prs: [
+      pr({ number: 1, commits: [{ t: '2026-10-14 10:00:00', login: null, email: '9+dr-john-h-watson[bot]@users.noreply.github.com' }] }),
+      pr({ repo: 'acme/other', number: 2 }),
+    ] });
+    const found = searchRepoPullRequests({ repos: ['acme/widgets'], from: '2026-10-01', to: '2026-10-31' }, gh);
+    assert.equal(gh.calls[0].variables.q, 'is:pr repo:acme/widgets updated:>=2026-09-30 created:<=2026-11-01');
+    assert.match(gh.calls[0].query, /author \{ email user \{ login \} \}/);
+    assert.deepEqual(found.map((p) => [p.number, p.authored]), [[1, [{ t: Date.parse(at('2026-10-14 10:00:00')), login: 'dr-john-h-watson[bot]' }]]]);
   });
 });
