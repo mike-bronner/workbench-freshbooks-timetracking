@@ -298,11 +298,11 @@ describe('freshbooks', () => {
       assert.deepEqual(pages, ['1', '2']);
     });
 
-    it('searches a window that covers every line day in the configured zone', async () => {
+    it('searches a window that covers the range and every line day in the configured zone', async () => {
       await plan([line({ date: '2026-10-14' }), line({ date: '2026-10-20' })]);
       const params = new URL(server.state.log.find((r) => r.method === 'GET').url, 'http://x').searchParams;
-      assert.equal(params.get('started_from'), '2026-10-13T07:00:00.000Z');
-      assert.equal(params.get('started_to'), '2026-10-22T07:00:00.000Z');
+      assert.equal(params.get('started_from'), '2026-09-30T07:00:00.000Z');
+      assert.equal(params.get('started_to'), '2026-11-02T07:00:00.000Z');
     });
   });
 
@@ -1310,6 +1310,9 @@ describe('freshbooks', () => {
     });
 
     it('relabels a general tag that no line can relabel from a tagged PR entry of the same repo and day, and keeps everything else', async () => {
+      updateConfig(configPath, (raw) => {
+        raw.freshbooks.flat_rate_days = { 'acme/widgets': ['2026-10-04', '2026-10-07'] };
+      });
       server.state.entries.push(
         held(808, at('2026-10-07 09:00:00'), 'General development [wbi:acme/widgets:2026-10-07]', { service_id: FLAT, billable: false, duration: 5400 }),
         held(830, at('2026-10-07 11:00:00'), 'PR #50: Fix ✨ [wbi:acme/widgets#50:2026-10-07]'),
@@ -1320,7 +1323,7 @@ describe('freshbooks', () => {
       const relabel = result.update.find((u) => u.id === 808);
       assert.deepEqual(
         [relabel.key, relabel.rate, relabel.via, relabel.relabelled_from, relabel.from, relabel.to],
-        ['acme/widgets:2026-10-07', 'as stored', 'same-day', 830, { note: 'General development [wbi:acme/widgets:2026-10-07]' }, { note: 'PR #50: Fix ✨' }],
+        ['acme/widgets:2026-10-07', 'flat-rate', 'same-day', 830, { note: 'General development [wbi:acme/widgets:2026-10-07]' }, { note: 'PR #50: Fix ✨' }],
       );
       assert.deepEqual(relabel.time_entry, {
         is_logged: true, started_at: at('2026-10-07 09:00:00'), duration: 5400, note: 'PR #50: Fix ✨', client_id: 5, project_id: 40, service_id: FLAT, billable: false,
@@ -1334,6 +1337,21 @@ describe('freshbooks', () => {
       assert.ok(server.state.entries.every((e) => !/\[wbi:|acme\/widgets[#:]/.test(e.note)));
       assert.deepEqual(ledger().entries['acme/widgets:2026-10-07'], [808]);
       assert.deepEqual(ledger().entries['acme/widgets#50:2026-10-07'], [830]);
+    });
+
+    it('moves a relabelled former general entry on an unmarked day from the flat-rate service to the hourly one', async () => {
+      server.state.entries.push(
+        held(808, at('2026-10-07 09:00:00'), 'General development [wbi:acme/widgets:2026-10-07]', { service_id: FLAT }),
+        held(830, at('2026-10-07 11:00:00'), 'PR #50: Fix ✨ [wbi:acme/widgets#50:2026-10-07]'),
+      );
+      const result = await plan(lines);
+      const relabel = result.update.find((u) => u.id === 808);
+      assert.deepEqual([relabel.rate, relabel.from.service_id, relabel.to], ['hourly', FLAT, { note: 'PR #50: Fix ✨', service_id: 9 }]);
+      await push(lines, result.approval);
+      const stored = server.state.entries.find((e) => e.id === 808);
+      assert.deepEqual([stored.note, stored.service_id, stored.billable], ['PR #50: Fix ✨', 9, true]);
+      const again = await plan(lines);
+      assert.deepEqual([again.update, again.blocked], [[], []]);
     });
 
     it('still blocks when the only PR entries are untagged, of another repo, or of another day', async () => {
@@ -1365,7 +1383,7 @@ describe('freshbooks', () => {
       assert.deepEqual(result.blocked, []);
       assert.match(result.approval, /^[0-9a-f]{16}$/);
       const relabel = result.update.find((u) => u.id === 808);
-      assert.deepEqual([relabel.relabelled_from, relabel.to], [832, { note: 'Issue #7: Docs' }]);
+      assert.deepEqual([relabel.rate, relabel.relabelled_from, relabel.to], ['hourly', 832, { note: 'Issue #7: Docs' }]);
       await push(lines, result.approval);
       assert.equal(server.state.entries.find((e) => e.id === 808).note, 'Issue #7: Docs');
       assert.ok(server.state.entries.every((e) => !/\[wbi:/i.test(e.note)));
@@ -1386,7 +1404,7 @@ describe('freshbooks', () => {
       ]);
       assert.ok(result.update.every((u) => ![834, 835].includes(u.id)));
       const relabel = result.update.find((u) => u.id === 808);
-      assert.deepEqual([relabel.relabelled_from, relabel.to], [832, { note: 'Issue #7: Docs' }]);
+      assert.deepEqual([relabel.rate, relabel.relabelled_from, relabel.to], ['hourly', 832, { note: 'Issue #7: Docs' }]);
     });
 
     it('still blocks when the only same-day entry belongs to another project', async () => {
@@ -1422,6 +1440,186 @@ describe('freshbooks', () => {
       const result = await plan(lines);
       assert.ok(result.update.every((u) => ![809, 810, 811].includes(u.id)));
       assert.deepEqual(result.blocked, []);
+    });
+  });
+
+  describe('flat-rate marks for former general entries', () => {
+    const FLAT = 11;
+    const DAY = 'acme/widgets:2026-10-23';
+    const lines = [line({ date: '2026-10-22', pr: 12 }), line({ date: '2026-10-24', pr: 13 })];
+    const ledgerFile = () => join(box.root, 'ledger.json');
+    const flatRate = async (...args) => JSON.parse(await cli('flat-rate', '--lines', linesFile(lines), ...args));
+    const days = () => JSON.parse(readFileSync(configPath, 'utf8')).freshbooks.flat_rate_days;
+    const entry = (id) => server.state.entries.find((e) => e.id === id);
+
+    beforeEach(() => {
+      server.state.services.push({ id: FLAT, name: 'Milestone', vis_state: 0 });
+      updateConfig(configPath, (raw) => {
+        raw.freshbooks.repos['acme/widgets'] = { ...MAPPING, flat_rate_service_id: FLAT };
+      });
+      writeFileSync(ledgerFile(), JSON.stringify({
+        business_id: 77,
+        entries: {
+          'acme/widgets#12:2026-10-22': [860],
+          'acme/widgets#13:2026-10-24': [861],
+          [DAY]: [870],
+          'acme/other:2026-10-23': [872],
+          'acme/widgets:2026-09-30': [873],
+          'acme/widgets:2026-10-25': [999],
+        },
+      }));
+      server.state.entries.push(
+        held(860, at('2026-10-22 10:00:00'), 'PR #12: Work'),
+        held(861, at('2026-10-24 10:00:00'), 'PR #13: Work'),
+        held(870, at('2026-10-23 09:00:00'), 'PR #45: LXXVAR import', { duration: 5400, billable: false }),
+        held(872, at('2026-10-23 10:00:00'), 'Other repo'),
+        held(873, at('2026-10-23 11:00:00'), 'Before the range'),
+      );
+    });
+
+    it('offers each former general entry that FreshBooks holds by ledger or tag, with its note, day and hours', async () => {
+      server.state.entries.push(held(871, at('2026-10-22 09:00:00'), 'General development [wbi:acme/widgets:2026-10-22]', { duration: 1800 }));
+      const out = await flatRate();
+      assert.deepEqual(out.items.map((i) => i.ref), ['acme/widgets#12', 'acme/widgets#13', DAY, 'acme/widgets:2026-10-22']);
+      assert.deepEqual(out.items.slice(2), [
+        { ref: DAY, kind: 'general', repo: 'acme/widgets', entries: [870], label: 'PR #45: LXXVAR import on 2026-10-23', flat_rate: false, billable_hours: 1.5, description: 'hourly, former general entry 870, 1.50 h' },
+        { ref: 'acme/widgets:2026-10-22', kind: 'general', repo: 'acme/widgets', entries: [871], label: 'General development [wbi:acme/widgets:2026-10-22] on 2026-10-22', flat_rate: false, billable_hours: 0.5, description: 'hourly, former general entry 871, 0.50 h' },
+      ]);
+      const before = readFileSync(configPath, 'utf8');
+      for (const ref of ['acme/widgets:2026-10-25', 'acme/other:2026-10-23', 'acme/widgets:2026-09-30']) {
+        await assert.rejects(flatRate('--mark', ref), /nor a former general entry that FreshBooks holds for it; nothing was saved/);
+      }
+      assert.equal(readFileSync(configPath, 'utf8'), before);
+    });
+
+    it('lists a day once, as its general line, when the lines still hold one', async () => {
+      const withLine = [...lines, line({ date: '2026-10-23' })];
+      const out = JSON.parse(await cli('flat-rate', '--lines', linesFile(withLine)));
+      assert.deepEqual(out.items.filter((i) => i.ref === DAY).map((i) => [i.label, i.description]), [['Work on branch main on 2026-10-23', 'hourly, 1 line(s), 0.25 h']]);
+    });
+
+    it('moves a marked former general entry to the flat-rate service, keeps its billable flag and note, and leaves nothing to do after the push', async () => {
+      const hourly = await plan(lines);
+      assert.deepEqual([hourly.update, hourly.blocked], [[], []]);
+      assert.deepEqual(hourly.skip.find((s) => s.existing_id === 870), { key: DAY, label: 'PR #45: LXXVAR import', rate: 'hourly', existing_id: 870 });
+      const marked = await flatRate('--mark', DAY);
+      assert.deepEqual(days(), { 'acme/widgets': ['2026-10-23'] });
+      assert.deepEqual(marked.items.find((i) => i.ref === DAY).description, 'flat-rate (saved mark), former general entry 870, 1.50 h');
+      const result = await plan(lines);
+      assert.notEqual(result.approval, hourly.approval);
+      assert.deepEqual(result.create, []);
+      assert.deepEqual(result.update.map(({ key, id, rate, via, from, to, hours }) => ({ key, id, rate, via, from, to, hours })), [
+        { key: DAY, id: 870, rate: 'flat-rate', via: 'ledger', from: { service_id: 9 }, to: { service_id: FLAT }, hours: 1.5 },
+      ]);
+      const table = await cli('plan', '--lines', linesFile(lines), '--format', 'table');
+      assert.match(table, /\| 2026-10-23 \| PR #45: LXXVAR import \| 1\.50 \| flat-rate \(saved mark\) \| 870 \| ledger \| 5 \| 40 \| unchanged \| 9 → 11 \|/);
+      await push(lines, result.approval);
+      assert.deepEqual(server.puts().map((p) => p.body.time_entry), [
+        { is_logged: true, started_at: at('2026-10-23 09:00:00'), duration: 5400, note: 'PR #45: LXXVAR import', client_id: 5, project_id: 40, service_id: FLAT, billable: false },
+      ]);
+      assert.deepEqual([entry(870).service_id, entry(870).billable, entry(870).note], [FLAT, false, 'PR #45: LXXVAR import']);
+      const again = await plan(lines);
+      assert.deepEqual([again.create, again.update, again.blocked], [[], [], []]);
+      assert.deepEqual(again.skip.find((s) => s.existing_id === 870).rate, 'flat-rate');
+      assert.ok([872, 873].every((id) => entry(id).service_id === 9));
+    });
+
+    it('moves the entry back to the hourly service when the mark is cleared', async () => {
+      await flatRate('--mark', DAY);
+      await planAndPush(lines);
+      const flat = await plan(lines);
+      const cleared = await flatRate('--clear', DAY);
+      assert.deepEqual(cleared.cleared, [DAY]);
+      assert.deepEqual(days(), {});
+      const result = await plan(lines);
+      assert.notEqual(result.approval, flat.approval);
+      assert.deepEqual(result.update.map(({ id, rate, from, to }) => ({ id, rate, from, to })), [{ id: 870, rate: 'hourly', from: { service_id: FLAT }, to: { service_id: 9 } }]);
+      await push(lines, result.approval);
+      assert.deepEqual([entry(870).service_id, entry(870).billable, entry(870).note], [9, false, 'PR #45: LXXVAR import']);
+      const again = await plan(lines);
+      assert.deepEqual([again.create, again.update, again.blocked], [[], [], []]);
+    });
+
+    it('blocks a marked former general entry while its repo has no flat-rate service', async () => {
+      await flatRate('--mark', DAY);
+      updateConfig(configPath, (raw) => {
+        raw.freshbooks.repos['acme/widgets'] = MAPPING;
+      });
+      const result = await plan(lines);
+      assert.equal(result.approval, null);
+      assert.deepEqual(result.blocked.map((b) => [b.action, b.reason]), [['update', 'acme/widgets has lines marked flat-rate but no flat-rate service mapped. Map one with map.sh --flat-rate-service, or clear the marks with flat-rate.sh']]);
+      await assert.rejects(push(lines, 'deadbeefdeadbeef'), /no flat-rate service mapped/);
+      assert.equal(server.puts().length, 0);
+    });
+
+    it('blocks a marked former general entry that still carries its tag while its repo has no flat-rate service', async () => {
+      updateConfig(configPath, (raw) => {
+        raw.freshbooks.repos['acme/widgets'] = MAPPING;
+        raw.freshbooks.flat_rate_days = { 'acme/widgets': ['2026-10-22'] };
+      });
+      server.state.entries.push(
+        held(871, at('2026-10-22 09:00:00'), 'General development [wbi:acme/widgets:2026-10-22]', { duration: 1800 }),
+        held(876, at('2026-10-22 11:00:00'), 'PR #46: LXX variant [wbi:acme/widgets#46:2026-10-22]', { duration: 3600 }),
+      );
+      const result = await plan(lines);
+      assert.equal(result.approval, null);
+      assert.deepEqual(result.blocked.map((b) => b.reason), ['acme/widgets has lines marked flat-rate but no flat-rate service mapped. Map one with map.sh --flat-rate-service, or clear the marks with flat-rate.sh']);
+      assert.ok(result.update.every((u) => u.id !== 871));
+    });
+
+    it('blocks a former general entry to update when the list leaves out a field of the full entry or of the compare', async () => {
+      await flatRate('--mark', DAY);
+      delete entry(870).client_id;
+      assert.match((await plan(lines)).blocked.map((b) => b.reason).join('\n'), /did not return client_id for entry 870, so the plan cannot send the full entry/);
+      entry(870).client_id = 5;
+      delete entry(870).service_id;
+      const result = await plan(lines);
+      assert.equal(result.approval, null);
+      assert.match(result.blocked.map((b) => b.reason).join('\n'), /did not return service_id for entry 870/);
+    });
+
+    it('blocks a former general entry to move whose stored note holds a malformed internal key, and gives no approval code', async () => {
+      entry(870).note = 'PR #45: LXXVAR [wbi:Acme Widgets:2026-10-23]';
+      assert.deepEqual((await plan(lines)).blocked, []);
+      await flatRate('--mark', DAY);
+      const result = await plan(lines);
+      assert.equal(result.approval, null);
+      assert.deepEqual(result.blocked.map((b) => b.reason), ['entry 870, recorded for acme/widgets:2026-10-23, has no note or a note that holds an internal key, so the plan cannot send it back to FreshBooks as it is']);
+      assert.ok(result.update.every((u) => u.id !== 870));
+      await assert.rejects(push(lines, 'deadbeefdeadbeef'), /holds an internal key.*nothing was created or updated/);
+      assert.equal(server.puts().length, 0);
+    });
+
+    it('offers and plans a former general entry on a day of the range that holds no line', async () => {
+      const EARLY = 'acme/widgets:2026-10-02';
+      const ledger = JSON.parse(readFileSync(ledgerFile(), 'utf8'));
+      writeFileSync(ledgerFile(), JSON.stringify({ ...ledger, entries: { ...ledger.entries, [EARLY]: [880] } }));
+      server.state.entries.push(held(880, at('2026-10-02 09:00:00'), 'Issue #7: Early work', { duration: 1800 }));
+      const out = await flatRate('--mark', EARLY);
+      assert.deepEqual(out.items.find((i) => i.ref === EARLY).description, 'flat-rate (saved mark), former general entry 880, 0.50 h');
+      const result = await plan(lines);
+      assert.deepEqual(result.update.map(({ id, rate, to }) => ({ id, rate, to })), [{ id: 880, rate: 'flat-rate', to: { service_id: FLAT } }]);
+      await push(lines, result.approval);
+      assert.equal(entry(880).service_id, FLAT);
+    });
+
+    it('relabels a marked former general entry that still carries its tag and moves it to the flat-rate service in one update', async () => {
+      updateConfig(configPath, (raw) => {
+        raw.freshbooks.flat_rate_days = { 'acme/widgets': ['2026-10-22'] };
+      });
+      server.state.entries.push(
+        held(871, at('2026-10-22 09:00:00'), 'General development [wbi:acme/widgets:2026-10-22]', { duration: 1800 }),
+        held(876, at('2026-10-22 11:00:00'), 'PR #46: LXX variant [wbi:acme/widgets#46:2026-10-22]', { duration: 3600 }),
+      );
+      const result = await plan(lines);
+      const relabel = result.update.find((u) => u.id === 871);
+      assert.deepEqual([relabel.rate, relabel.via, relabel.from, relabel.to], [
+        'flat-rate', 'same-day', { note: 'General development [wbi:acme/widgets:2026-10-22]', service_id: 9 }, { note: 'PR #46: LXX variant', service_id: FLAT },
+      ]);
+      await push(lines, result.approval);
+      assert.deepEqual([entry(871).note, entry(871).service_id, entry(871).billable], ['PR #46: LXX variant', FLAT, true]);
+      const again = await plan(lines);
+      assert.deepEqual([again.update, again.blocked], [[], []]);
     });
   });
 

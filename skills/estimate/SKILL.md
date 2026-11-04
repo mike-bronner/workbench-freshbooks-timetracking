@@ -227,7 +227,10 @@ that repo on that day, a former "General development" entry takes the note of
 the longest tagged PR or issue entry of the same repo, project and day,
 without its tag. Its Match cell then reads "relabelled from same-day entry"
 and that entry's id. Tell Mike in one sentence that this note is a guess from
-FreshBooks, and that its rate stays as stored. Each row also shows the
+FreshBooks, and that its rate is the rate of its day. A former "General
+development" entry that no line matches also takes the service of its day:
+flat-rate when Mike marked that day in step 7, hourly otherwise. Its billable
+flag and note stay as they are. Each row also shows the
 entry id, how the plan matched it ("ledger" or "older tag"), its client and
 project, and, for the billable flag and the service,
 the old and new value or "unchanged". An update never changes the duration or
@@ -295,9 +298,8 @@ mark has one of three kinds:
 
 - A PR mark covers every line of that PR.
 - An issue mark covers every issue line of that issue.
-- A branch-day mark covers the branch line of one repo on one day. A mark
-  saved earlier for a former general line keeps that entry flat-rate after it
-  is relabelled.
+- A day mark covers one repo on one day: its branch line, and each former
+  "General development" entry of that day, whatever its note says now.
 
 Run:
 
@@ -305,14 +307,20 @@ Run:
 bash "${CLAUDE_PLUGIN_ROOT}/bin/flat-rate.sh" --lines '<lines file>'
 ```
 
-It prints `items`, one per PR, issue and branch day in the lines file. Each
-item has these fields:
+It prints `items`, one per PR, issue and branch day in the lines file. It
+also prints one item per day that holds a former "General development" entry
+in FreshBooks, in the repos and range of the lines file, when the lines hold
+no branch line for that day. Each item has these fields:
 
 - `ref`: `owner/name#number` for a PR or an issue, and `owner/name:YYYY-MM-DD`
-  for a branch day.
-- `kind`: `pr`, `issue` or `general` (a branch day).
-- `label`, and `flat_rate`, which is true when a saved mark applies.
-- `description`.
+  for a day.
+- `kind`: `pr`, `issue` or `general` (a day).
+- `label`, and `flat_rate`, which is true when a saved mark applies. The
+  `label` of a former general entry is its current note and its date.
+- `description`. For a former general entry it names the entry ids and the
+  hours that FreshBooks holds.
+
+The script reads FreshBooks, so it needs the login that step 1 checks.
 
 Ask "Which flat-rate marks do you want to change?" with these options:
 

@@ -47,7 +47,7 @@ secrets either.
 | `freshbooks.repos` | `{}` | Lower-case `owner/name` to `{client_id, project_id, service_id}`, plus an optional `flat_rate_service_id`, saved by `map.sh`; `service_id` is the hourly service |
 | `freshbooks.flat_rate_prs` | `{}` | Lower-case `owner/name` to the PR numbers marked flat-rate, saved by `flat-rate.sh` |
 | `freshbooks.flat_rate_issues` | `{}` | Lower-case `owner/name` to the issue numbers marked flat-rate, saved by `flat-rate.sh` |
-| `freshbooks.flat_rate_days` | `{}` | Lower-case `owner/name` to the `YYYY-MM-DD` days whose branch line is flat-rate, saved by `flat-rate.sh`. A mark saved for a former general line keeps that entry flat-rate after it is relabelled |
+| `freshbooks.flat_rate_days` | `{}` | Lower-case `owner/name` to the `YYYY-MM-DD` days whose branch line is flat-rate, saved by `flat-rate.sh`. A day mark also sets the rate of each former general entry of that repo and day |
 
 The client secret and the tokens live only in the macOS keychain, under the
 service `workbench-freshbooks-timetracking`. No script prints them, and none
@@ -117,12 +117,15 @@ bin/push.sh --lines lines.json --approve <code>
   FreshBooks before it saves them, and refuses a flat-rate service equal to
   the hourly one.
 - `flat-rate.sh` lists the PRs, issues and branch days of a lines file, and
-  whether a saved mark makes each one flat-rate. `--mark` saves a mark for an
-  item in the file, and `--clear` removes a saved mark. An item is
-  `owner/name#number` for a PR or an issue, and `owner/name:YYYY-MM-DD` for
-  the branch line of one repo on one day. A PR mark covers every line of its
-  PR, and an issue mark every issue line of its issue. A mark holds in every
-  later run, until it is cleared.
+  whether a saved mark makes each one flat-rate. It also lists, by day, each
+  former general entry that FreshBooks holds in the repos and range of the
+  file, found by its ledger record or its older tag, with its current note,
+  entry ids and hours. `--mark` saves a mark for a listed item, and `--clear`
+  removes a saved mark. An item is `owner/name#number` for a PR or an issue,
+  and `owner/name:YYYY-MM-DD` for one repo on one day: its branch line or its
+  former general entries. A PR mark covers every line of its PR, and an issue
+  mark every issue line of its issue. A mark holds in every later run, until
+  it is cleared.
 - `plan.sh` turns each line into an entry: `is_logged` true, a duration of the
   billable hours in seconds, a `started_at` at the line's first work on its
   local day, the mapped client and project, and the label as the note. A note
@@ -159,8 +162,12 @@ bin/push.sh --lines lines.json --approve <code>
   without a tag stays as it is, so an edit made in FreshBooks survives. An
   entry matched through a former general line keeps the rate of its day:
   flat-rate when the day carries a flat-rate mark, hourly otherwise, whatever
-  the rate of the line that took over its time. A tagged entry in the range and repos of the
-  lines that no line matches loses its tag, and keeps everything else.
+  the rate of the line that took over its time. A former general entry that
+  no line matches, known by its ledger record in the range and repos of the
+  lines, also takes the service of its day, and keeps its billable flag and
+  note. A tagged entry in the range and repos of the
+  lines that no line matches loses its tag, and keeps everything else. When
+  the tag is a general one, the entry also takes the service of its day.
   When that tag is a general one, no line can relabel the entry. It then
   takes the note of a tagged PR or issue entry in the same repo, project and
   day, without its tag. The longest such entry gives the note, and on equal
@@ -186,6 +193,8 @@ bin/push.sh --lines lines.json --approve <code>
     project and day can give it a note.
   - A tagged entry that no line matches has a note that is empty, or still
     holds an internal key, once its tag is dropped.
+  - A former general entry that the ledger records has to move to the
+    service of its day, but has no note, or a note that holds an internal key.
 - The plan table groups the new entries by repo in order of first work, shows
   the rate of each line, marks git-sourced lines, and splits hourly from
   flat-rate hours. A separate section lists the updates with the client and
