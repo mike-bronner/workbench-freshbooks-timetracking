@@ -1,7 +1,7 @@
 {
   "name": "workbench-freshbooks-timetracking",
   "description": "Turns AI development work in GitHub repos into reviewed, reproducible FreshBooks time entries. Part of the claude-workbench marketplace.",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "author": {
     "name": "Mike Bronner",
     "url": "https://github.com/mike-bronner"
